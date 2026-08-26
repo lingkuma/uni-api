@@ -361,11 +361,7 @@ fn provider_uses_responses_chat(provider: &Provider) -> bool {
 fn precommit_chat_stream(execution: AttemptLoop) -> Response<Body> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     tokio::spawn(async move {
-        if tx
-            .send(Ok(Bytes::from_static(b": uni-api-precommit\n\n")))
-            .await
-            .is_err()
-        {
+        if tx.send(Ok(Bytes::from_static(b":\n\n"))).await.is_err() {
             return;
         }
         let response = run_attempt_loop(execution).await;

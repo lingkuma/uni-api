@@ -225,9 +225,7 @@ fn spawn_translation(
     let (outcome_tx, outcome_rx) = oneshot::channel();
     tokio::spawn(async move {
         if emit_precommit_comment {
-            let _ = tx
-                .send(Ok(Bytes::from_static(b": uni-api-precommit\n\n")))
-                .await;
+            let _ = tx.send(Ok(Bytes::from_static(b":\n\n"))).await;
         }
         let options = TranslationOptions {
             include_usage,
@@ -2002,7 +2000,7 @@ mod tests {
         let outcome = translation.outcome.await.unwrap();
         let wire = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(wire.starts_with(": uni-api-precommit\n\n"));
+        assert!(wire.starts_with(":\n\n"));
         assert!(wire.contains("\"content\":\"hello\""));
         assert!(wire.contains("\"finish_reason\":\"stop\""));
         assert!(wire.ends_with("data: [DONE]\n\n"));
@@ -2067,7 +2065,7 @@ mod tests {
         let outcome = translation.outcome.await.unwrap();
         let wire = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(wire.starts_with(": uni-api-precommit\n\n"));
+        assert!(wire.starts_with(":\n\n"));
         assert!(wire.contains("Concurrency limit exceeded for account"));
         assert!(!wire.contains("finish_reason"));
         assert!(!wire.contains("\"usage\""));
