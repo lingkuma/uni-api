@@ -398,8 +398,6 @@ pub async fn serve_native(
                 if let Ok(value) = HeaderValue::from_str(route.request_id()) {
                     control_headers.insert("x-request-id", value);
                 }
-                control_headers
-                    .insert("access-control-allow-origin", HeaderValue::from_static("*"));
                 return start_public_stream(
                     state,
                     Coordinator::Native { route },
@@ -453,8 +451,6 @@ pub async fn serve_native(
                 if let Ok(value) = HeaderValue::from_str(route.request_id()) {
                     control_headers.insert("x-request-id", value);
                 }
-                control_headers
-                    .insert("access-control-allow-origin", HeaderValue::from_static("*"));
                 return start_public_stream(
                     state,
                     Coordinator::Native { route },
@@ -536,7 +532,6 @@ async fn serve_native_nonstream(
                 if let Ok(value) = HeaderValue::from_str(route.request_id()) {
                     headers.insert("x-request-id", value);
                 }
-                headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
                 if let Some(owner) = idempotency_owner.take() {
                     let bytes = Bytes::from(body.clone());
                     if body.len() <= owner.max_response_bytes()

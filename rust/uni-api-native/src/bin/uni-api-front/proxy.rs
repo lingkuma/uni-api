@@ -136,6 +136,16 @@ impl AppState {
 }
 
 pub async fn handler(State(state): State<AppState>, request: Request) -> Response<Body> {
+    let cors = crate::cors::CorsRequest::from_headers(request.headers());
+    if let Some(response) = cors.preflight_response(request.method(), request.headers()) {
+        return response;
+    }
+    let mut response = handler_inner(state, request).await;
+    cors.apply(&mut response);
+    response
+}
+
+async fn handler_inner(state: AppState, request: Request) -> Response<Body> {
     let request = match crate::request_decompression::decode(request).await {
         Ok(request) => request,
         Err(response) => return response,
