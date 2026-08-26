@@ -32,7 +32,7 @@ class _RouteState:
 
 
 class ProviderModelCircuitBreaker:
-    """Bound deterministic 403/404 retries for one provider-model route."""
+    """Bound deterministic route failures for one provider-model pair."""
 
     def __init__(
         self,
@@ -87,7 +87,7 @@ class ProviderModelCircuitBreaker:
 
     def record_failure(self, provider: str, model: str, status_code: int) -> bool:
         status_code = int(status_code)
-        if status_code not in (403, 404):
+        if status_code not in (400, 403, 404):
             return False
         key = self._key(provider, model)
         if not all(key):

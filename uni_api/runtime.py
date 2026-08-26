@@ -67,6 +67,7 @@ from uni_api.routing.request_types import detect_request_type
 from upstream import (
     UPSTREAM_NETWORK_ERRORS,
     UpstreamRunner,
+    build_routing_final_response,
     build_upstream_error_response,
     finalize_latest_routing_attempt,
     finalize_response_memory_attempt,
@@ -4498,10 +4499,7 @@ class ModelRequestHandler:
                 current_info["first_response_time"] = -1
                 current_info["success"] = False
                 current_info["provider"] = None
-            return JSONResponse(
-                status_code=completed_plan.status_code,
-                content={"error": f"All {request_data.model} error: {completed_plan.error_message}"},
-            )
+            return build_routing_final_response(completed_plan, request_data.model)
 
         return await runner.run(
             execute_attempt,
@@ -9651,10 +9649,7 @@ class ResponsesRequestExecution:
         self.current_info["first_response_time"] = -1
         self.current_info["success"] = False
         self.current_info["provider"] = None
-        return JSONResponse(
-            status_code=completed_plan.status_code,
-            content={"error": f"All {self.request_model_name} error: {completed_plan.error_message}"},
-        )
+        return build_routing_final_response(completed_plan, self.request_model_name)
 
 
 class MessagesPassthroughHandler:
@@ -10323,10 +10318,7 @@ class MessagesPassthroughHandler:
         current_info["first_response_time"] = -1
         current_info["success"] = False
         current_info["provider"] = None
-        return JSONResponse(
-            status_code=completed_plan.status_code,
-            content={"error": f"All {ctx['request_model_name']} error: {completed_plan.error_message}"},
-        )
+        return build_routing_final_response(completed_plan, ctx["request_model_name"])
 
 class VideoTaskHandler:
     def __init__(self):
@@ -10996,10 +10988,7 @@ class VideoTaskHandler:
         current_info["first_response_time"] = -1
         current_info["success"] = False
         current_info["provider"] = None
-        return JSONResponse(
-            status_code=completed_plan.status_code,
-            content={"error": f"All {ctx['request_model_name']} error: {completed_plan.error_message}"},
-        )
+        return build_routing_final_response(completed_plan, ctx["request_model_name"])
 
 class LingjingOpenapiHandler:
     def __init__(self):
@@ -11326,10 +11315,7 @@ class LingjingOpenapiHandler:
         current_info["first_response_time"] = -1
         current_info["success"] = False
         current_info["provider"] = None
-        return JSONResponse(
-            status_code=completed_plan.status_code,
-            content={"error": f"All {ctx['request_model_name']} error: {completed_plan.error_message}"},
-        )
+        return build_routing_final_response(completed_plan, ctx["request_model_name"])
 
 model_handler = ModelRequestHandler()
 responses_handler = ResponsesRequestHandler()

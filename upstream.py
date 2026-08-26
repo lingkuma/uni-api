@@ -153,6 +153,13 @@ def remap_status_code_from_error(status_code: int, error_message: str) -> int:
     return _PROVIDER_ERROR_CLASSIFIER.remap_status_code(status_code, error_message)
 
 
+def _is_provider_model_unavailable_error(status_code: int, details: Any) -> bool:
+    return _PROVIDER_ERROR_CLASSIFIER.is_provider_model_unavailable_error(
+        status_code,
+        details,
+    )
+
+
 def should_retry_provider(
     auto_retry: Any,
     status_code: int,
@@ -257,6 +264,8 @@ async def maybe_exclude_failed_channel(
     provider: Optional[dict] = None,
     exclude_error_substrings: Optional[list[str]] = None,
     debug: bool = False,
+    provider_model_unavailable: bool = False,
+    circuit_status_code: Optional[int] = None,
 ) -> str | None:
     channel_manager = getattr(plan.app.state, "channel_manager", None)
     exclude_error_substrings = exclude_error_substrings or []
@@ -266,12 +275,13 @@ async def maybe_exclude_failed_channel(
         error in error_message for error in exclude_error_substrings
     )
 
-    if status_code in (403, 404):
+    if status_code in (403, 404) or provider_model_unavailable:
+        recorded_status = int(circuit_status_code or status_code)
         record_failure = getattr(channel_manager, "record_model_failure", None)
         if callable(record_failure):
             opened = bool(
                 await _maybe_await(
-                    record_failure(provider_name, actual_model, status_code)
+                    record_failure(provider_name, actual_model, recorded_status)
                 )
             )
             if opened:
@@ -280,7 +290,7 @@ async def maybe_exclude_failed_channel(
                     "status_code=%s",
                     _observable_provider_name(provider_name),
                     str(actual_model or "")[:256],
-                    status_code,
+                    recorded_status,
                 )
                 try:
                     await plan.refresh_matching_providers(debug=debug)
@@ -364,6 +374,31 @@ def build_upstream_error_response(status_code: int, error_message: Any, fallback
     if fallback_prefix:
         message_text = f"{fallback_prefix}: {message_text}"
     return JSONResponse(status_code=status_code, content={"error": message_text})
+
+
+def build_routing_final_response(
+    completed_plan: RoutingPlan,
+    request_model: str,
+) -> JSONResponse:
+    if (
+        completed_plan.status_code == 503
+        and _is_provider_model_unavailable_error(400, completed_plan.error_message)
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "all_providers_failed",
+                    "message": f"All configured providers failed for model {request_model}",
+                    "param": "model",
+                    "type": "server_error",
+                }
+            },
+        )
+    return JSONResponse(
+        status_code=completed_plan.status_code,
+        content={"error": f"All {request_model} error: {completed_plan.error_message}"},
+    )
 
 
 @dataclass
@@ -662,6 +697,9 @@ class UpstreamRunner:
             ),
             "provider_model_circuit_blocks_retry": bool(
                 attempt.state.get("provider_model_circuit_blocks_retry")
+            ),
+            "provider_model_unavailable": bool(
+                attempt.state.get("provider_model_unavailable")
             ),
         }
         for key in (
@@ -1075,6 +1113,11 @@ class UpstreamRunner:
         transport_failure = self._classify_transport_failure(attempt, exc)
         status_code, error_message = normalize_provider_exception(exc)
         original_status_code = status_code
+        provider_model_unavailable = _is_provider_model_unavailable_error(
+            original_status_code,
+            error_message,
+        )
+        attempt.state["provider_model_unavailable"] = provider_model_unavailable
         status_code = remap_status_code_from_error(status_code, error_message)
         local_admission_rejection = bool(
             getattr(exc, "local_admission_rejection", False)
@@ -1167,6 +1210,8 @@ class UpstreamRunner:
                 provider=attempt.provider,
                 exclude_error_substrings=exclude_error_substrings,
                 debug=self.debug,
+                provider_model_unavailable=provider_model_unavailable,
+                circuit_status_code=original_status_code,
             )
             attempt.state["provider_model_circuit_opened"] = bool(
                 circuit_result
@@ -1184,6 +1229,7 @@ class UpstreamRunner:
         )
         should_cool_key = bool(
             not local_admission_rejection
+            and not provider_model_unavailable
             and (
                 transport_failure is None
                 or transport_failure.provider_penalty_eligible
@@ -1193,6 +1239,7 @@ class UpstreamRunner:
         if (
             should_cool_down is not None
             and not local_admission_rejection
+            and not provider_model_unavailable
             and (
                 transport_failure is None
                 or transport_failure.provider_penalty_eligible

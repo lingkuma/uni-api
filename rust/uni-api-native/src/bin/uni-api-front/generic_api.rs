@@ -838,9 +838,17 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     *response.status_mut() = failure.status;
                 }
                 last_status = failure.status;
-                last_detail = failure.detail.clone();
-                if let Some(response) = failure.response.take() {
-                    last_upstream_response = Some(response);
+                if policy.provider_model_unavailable {
+                    last_detail = format!(
+                        "All configured providers failed for model {}",
+                        execution.request_model
+                    );
+                    last_upstream_response = None;
+                } else {
+                    last_detail = failure.detail.clone();
+                    if let Some(response) = failure.response.take() {
+                        last_upstream_response = Some(response);
+                    }
                 }
                 execution.state.persistence.record_channel(ChannelStat {
                     request_id: execution.request_id.clone(),
@@ -861,6 +869,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                             has_alternative: execution.providers.len() > 1,
                             status: failure.status.as_u16(),
                             detail: &failure.detail,
+                            provider_model_unavailable: policy.provider_model_unavailable,
                             force_quota_cooldown: policy.force_quota_cooldown,
                         })
                         .await;
@@ -1154,6 +1163,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                         has_alternative,
                                         status: policy.status,
                                         detail: &outcome.detail,
+                                        provider_model_unavailable: policy
+                                            .provider_model_unavailable,
                                         force_quota_cooldown: policy.force_quota_cooldown,
                                     })
                                     .await;
@@ -1231,9 +1242,15 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     *response.status_mut() = failure.status;
                 }
                 last_status = failure.status;
-                last_detail = failure.detail.clone();
-                if let Some(response) = failure.response.take() {
-                    last_upstream_response = Some(response);
+                if policy.provider_model_unavailable {
+                    last_detail =
+                        format!("All configured providers failed for model {request_model}");
+                    last_upstream_response = None;
+                } else {
+                    last_detail = failure.detail.clone();
+                    if let Some(response) = failure.response.take() {
+                        last_upstream_response = Some(response);
+                    }
                 }
                 state.persistence.record_channel(ChannelStat {
                     request_id: request_id.clone(),
@@ -1253,6 +1270,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             has_alternative: providers.len() > 1,
                             status: failure.status.as_u16(),
                             detail: &failure.detail,
+                            provider_model_unavailable: policy.provider_model_unavailable,
                             force_quota_cooldown: policy.force_quota_cooldown,
                         })
                         .await;

@@ -742,6 +742,81 @@ def test_responses_codex_chatgpt_model_unsupported_retries_next_key(monkeypatch)
     assert keys.cooling_until["key-1"] > 0
 
 
+def test_responses_provider_model_unavailable_retries_next_provider_without_key_cooldown(monkeypatch):
+    provider_a = "provider-model-missing-a"
+    provider_b = "provider-model-missing-b"
+    keys_a = DummyCircularList(["key-a"])
+    keys_b = DummyCircularList(["key-b"])
+    monkeypatch.setitem(main.provider_api_circular_list, provider_a, keys_a)
+    monkeypatch.setitem(main.provider_api_circular_list, provider_b, keys_b)
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_a,
+                "_model_dict_cache": {"gpt-5.6-sol": "gpt-5.6-sol"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {"api_key_cooldown_period": 60},
+            },
+            {
+                "provider": provider_b,
+                "_model_dict_cache": {"gpt-5.6-sol": "gpt-5.6-sol"},
+                "base_url": "https://provider-b.example/v1/responses",
+                "api": ["key-b"],
+                "preferences": {},
+            },
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.6-sol"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = SequencedDummyClientManager(
+        [
+            httpx.Response(
+                400,
+                request=httpx.Request("POST", "https://provider-a.example/v1/responses"),
+                json={
+                    "error": {
+                        "code": "model_not_found",
+                        "message": "unknown provider for model gpt-5.6-sol",
+                    }
+                },
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://provider-b.example/v1/responses"),
+                json={"id": "resp-provider-b", "status": "completed"},
+            ),
+        ]
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.6-sol",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["id"] == "resp-provider-b"
+    assert [call["headers"]["Authorization"] for call in main.app.state.client_manager.post_calls] == [
+        "Bearer key-a",
+        "Bearer key-b",
+    ]
+    assert keys_a.cooling_calls == []
+
+
 def test_responses_compact_codex_chatgpt_model_unsupported_retries_next_key(monkeypatch):
     provider_name = "codex"
     keys = main.ThreadSafeCircularList(

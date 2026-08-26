@@ -1,7 +1,10 @@
+import json
+
 import httpx
 import pytest
 from fastapi import HTTPException
 
+from upstream import build_routing_final_response
 from uni_api.upstream.policies import CooldownPolicy, ProviderErrorClassifier, RetryPolicy
 from uni_api.upstream.responses_errors import responses_failure_error
 from uni_api.upstream.transport_errors import classify_httpx_transport_error
@@ -264,6 +267,87 @@ def test_provider_error_classifier_keeps_real_bad_request_non_retryable():
         {"base_url": "https://provider.example/v1/messages"},
         error_message=str(details),
     ) is False
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {
+            "error": {
+                "code": "model_not_found",
+                "message": "unknown provider for model gpt-5.6-sol",
+            }
+        },
+        {
+            "error": {
+                "message": json.dumps(
+                    {
+                        "error": {
+                            "code": "unknown_provider",
+                            "message": "unknown provider for model gpt-5.6-sol",
+                        }
+                    }
+                )
+            }
+        },
+    ],
+)
+def test_provider_model_unavailable_400_retries_and_remaps_to_503(details):
+    classifier = ProviderErrorClassifier(_safe_get)
+    retry_policy = RetryPolicy(classifier, _get_engine)
+
+    assert classifier.is_provider_model_unavailable_error(400, details) is True
+    assert classifier.remap_status_code(400, json.dumps(details)) == 503
+    assert retry_policy.should_retry(
+        True,
+        400,
+        {"base_url": "https://provider.example/v1/responses"},
+        error_message=json.dumps(details),
+    ) is True
+
+
+def test_generic_model_unavailable_text_is_not_retried():
+    classifier = ProviderErrorClassifier(_safe_get)
+    details = {
+        "error": {
+            "type": "invalid_request_error",
+            "message": "model unavailable for this request",
+        }
+    }
+
+    assert classifier.is_provider_model_unavailable_error(400, details) is False
+    assert classifier.remap_status_code(400, json.dumps(details)) == 400
+
+
+def test_provider_model_unavailable_exhaustion_returns_bounded_503():
+    response = build_routing_final_response(
+        type(
+            "CompletedPlan",
+            (),
+            {
+                "status_code": 503,
+                "error_message": json.dumps(
+                    {
+                        "error": {
+                            "code": "model_not_found",
+                            "message": "unknown provider for model gpt-5.6-sol",
+                        }
+                    }
+                ),
+            },
+        )(),
+        "gpt-5.6-sol",
+    )
+
+    assert response.status_code == 503
+    assert json.loads(response.body) == {
+        "error": {
+            "code": "all_providers_failed",
+            "message": "All configured providers failed for model gpt-5.6-sol",
+            "param": "model",
+            "type": "server_error",
+        }
+    }
 
 
 def test_provider_error_classifier_does_not_remap_pricing_text_on_non400_status():

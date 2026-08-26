@@ -414,7 +414,7 @@ pub async fn serve_native(
                     StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
                 route.emit_final_response(status.as_u16(), "native_hedge_exhausted");
                 release_owner(&mut idempotency_owner).await;
-                return json_error(status, route.last_detail());
+                return json_error(status, &route.response_detail());
             }
             Err(error) => {
                 route.emit_internal_failure(502, "native_hedge_error", &error);
@@ -431,7 +431,7 @@ pub async fn serve_native(
                     StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
                 route.emit_final_response(status.as_u16(), "native_route_exhausted");
                 release_owner(&mut idempotency_owner).await;
-                return json_error(status, route.last_detail());
+                return json_error(status, &route.response_detail());
             }
             Err(error) if error == "native-codex-oauth-fallback" => {
                 route.emit_internal_failure(502, "native_codex_oauth_fallback", &error);
@@ -470,7 +470,7 @@ pub async fn serve_native(
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     route.emit_final_response(status.as_u16(), "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(status, route.last_detail());
+                    return json_error(status, &route.response_detail());
                 }
             }
             Err(error) => {
@@ -483,7 +483,7 @@ pub async fn serve_native(
                 if !route.record_failure(&outcome).await {
                     route.emit_final_response(502, "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(StatusCode::BAD_GATEWAY, route.last_detail());
+                    return json_error(StatusCode::BAD_GATEWAY, &route.response_detail());
                 }
             }
         }
@@ -503,7 +503,7 @@ async fn serve_native_nonstream(
                     StatusCode::from_u16(route.last_status()).unwrap_or(StatusCode::BAD_GATEWAY);
                 route.emit_final_response(status.as_u16(), "native_route_exhausted");
                 release_owner(&mut idempotency_owner).await;
-                return json_error(status, route.last_detail());
+                return json_error(status, &route.response_detail());
             }
             Err(error) => {
                 route.emit_internal_failure(400, "native_plan_error", &error);
@@ -584,7 +584,7 @@ async fn serve_native_nonstream(
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     route.emit_final_response(final_status.as_u16(), "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(final_status, route.last_detail());
+                    return json_error(final_status, &route.response_detail());
                 }
             }
             Err(error) => {
@@ -597,7 +597,7 @@ async fn serve_native_nonstream(
                 if !route.record_failure(&outcome).await {
                     route.emit_final_response(502, "failed_before_commit");
                     release_owner(&mut idempotency_owner).await;
-                    return json_error(StatusCode::BAD_GATEWAY, route.last_detail());
+                    return json_error(StatusCode::BAD_GATEWAY, &route.response_detail());
                 }
             }
         }

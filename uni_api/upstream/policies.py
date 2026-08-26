@@ -44,6 +44,26 @@ _MODEL_PRICING_UNCONFIGURED_MARKERS = (
     "价格尚未由管理员配置",
 )
 
+# These values identify a selected upstream route whose provider-side model
+# mapping disappeared after local configuration was validated. They are not
+# caller validation errors, so the router may safely try another configured
+# provider before any response bytes have been committed.
+_PROVIDER_MODEL_UNAVAILABLE_CODES = frozenset(
+    {
+        "model_not_found",
+        "model_not_supported",
+        "model_unsupported",
+        "unknown_provider",
+        "unsupported_model",
+    }
+)
+_PROVIDER_MODEL_UNAVAILABLE_MARKERS = (
+    "unknown provider for model",
+    "no provider found for model",
+    "no provider available for model",
+    "model is not supported by this provider",
+)
+
 
 def _timeout_seconds_text(value: Any) -> Optional[str]:
     if isinstance(value, bool):
@@ -180,6 +200,11 @@ class ProviderErrorClassifier:
             return 502
         if "Provider API error: bad response status code 400" in error_message:
             return 502
+        if self.is_provider_model_unavailable_error(status_code, error_message):
+            # A provider advertised by local routing configuration rejected
+            # that model at execution time. Expose this as temporary upstream
+            # unavailability, not as a malformed client request.
+            return 503
         if self.is_model_pricing_unconfigured_error(status_code, error_message):
             # The caller's request is valid; the upstream gateway rejected it
             # because its own administrator-side model pricing is incomplete.
@@ -191,6 +216,37 @@ class ProviderErrorClassifier:
         if "<head><title>413 Request Entity Too Large</title></head>" in error_message:
             return 429
         return status_code
+
+    def is_provider_model_unavailable_error(
+        self,
+        status_code: int,
+        details: Any,
+    ) -> bool:
+        """Identify a configured route rejected by the selected provider.
+
+        Compatible gateways commonly wrap the original OpenAI-shaped error in
+        another error.message string, so inspect at most three structured
+        layers. The bounded code and phrase allow-lists deliberately leave
+        ordinary parameter-validation 400s request-scoped.
+        """
+
+        if status_code not in (400, 404):
+            return False
+
+        candidate: Any = details
+        for _depth in range(3):
+            code, _error_type, message, _raw = self.details_parts(candidate)
+            if code in _PROVIDER_MODEL_UNAVAILABLE_CODES:
+                return True
+            if message and any(
+                marker in message.casefold()
+                for marker in _PROVIDER_MODEL_UNAVAILABLE_MARKERS
+            ):
+                return True
+            if not message or self._json_or_python_dict(message) is None:
+                break
+            candidate = message
+        return False
 
     def is_model_pricing_unconfigured_error(
         self,
@@ -360,6 +416,11 @@ class RetryPolicy:
         if not auto_retry:
             return False
         if self.classifier.is_model_pricing_unconfigured_error(
+            status_code,
+            error_message,
+        ):
+            return True
+        if self.classifier.is_provider_model_unavailable_error(
             status_code,
             error_message,
         ):

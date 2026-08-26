@@ -169,6 +169,7 @@ pub(crate) struct FailedRoute<'a> {
     pub(crate) has_alternative: bool,
     pub(crate) status: u16,
     pub(crate) detail: &'a str,
+    pub(crate) provider_model_unavailable: bool,
     pub(crate) force_quota_cooldown: bool,
 }
 
@@ -177,6 +178,7 @@ pub(crate) struct ProviderFailurePolicy {
     pub(crate) status: u16,
     pub(crate) retryable: bool,
     pub(crate) request_scoped: bool,
+    pub(crate) provider_model_unavailable: bool,
     pub(crate) force_quota_cooldown: bool,
 }
 
@@ -271,6 +273,7 @@ pub struct NativeRoute {
     last_attempt: Option<NativeAttemptObservation>,
     last_status: u16,
     last_detail: String,
+    last_provider_model_unavailable: bool,
     has_attempt_failure: bool,
     last_failure_origin: String,
     routing_attempts: usize,
@@ -904,9 +907,10 @@ impl NativeConfigStore {
             has_alternative,
             status,
             detail,
+            provider_model_unavailable,
             force_quota_cooldown,
         } = failure;
-        if matches!(status, 403 | 404) {
+        if provider_model_unavailable || matches!(status, 403 | 404) {
             let now = tokio::time::Instant::now();
             let route_key = (provider.name.to_string(), original_model.to_owned());
             let mut failures = self.route_failures.lock().await;
@@ -939,7 +943,7 @@ impl NativeConfigStore {
                 tokio::time::Instant::now() + Duration::from_secs_f64(channel_seconds),
             );
         }
-        if provider.api_keys.len() <= 1 {
+        if provider_model_unavailable || provider.api_keys.len() <= 1 {
             return;
         }
         let lower_detail = detail.to_ascii_lowercase();
@@ -1068,8 +1072,15 @@ impl NativeRoute {
         self.last_status
     }
 
-    pub fn last_detail(&self) -> &str {
-        &self.last_detail
+    pub fn response_detail(&self) -> String {
+        if self.last_provider_model_unavailable {
+            format!(
+                "All configured providers failed for model {}",
+                self.request_model
+            )
+        } else {
+            self.last_detail.clone()
+        }
     }
 
     pub fn has_attempts_remaining(&self) -> bool {
@@ -1260,10 +1271,16 @@ impl NativeRoute {
         let status = policy.status;
         self.last_status = status;
         self.last_detail = detail.chars().take(4096).collect();
+        self.last_provider_model_unavailable = policy.provider_model_unavailable;
         self.has_attempt_failure = true;
         self.last_failure_origin = failure_origin(outcome).to_owned();
         let upstream_status = outcome_status_from(outcome, "upstream_status_code", original_status);
-        self.emit_upstream_attempt(outcome, upstream_status, false);
+        self.emit_upstream_attempt(
+            outcome,
+            upstream_status,
+            false,
+            policy.provider_model_unavailable,
+        );
         self.record_current_channel(false);
         if let (Some(provider), Some(original_model)) =
             (self.last_provider.clone(), self.last_original_model.clone())
@@ -1296,6 +1313,7 @@ impl NativeRoute {
                         has_alternative: self.providers.len() > 1,
                         status,
                         detail,
+                        provider_model_unavailable: policy.provider_model_unavailable,
                         force_quota_cooldown: policy.force_quota_cooldown,
                     })
                     .await;
@@ -1329,7 +1347,7 @@ impl NativeRoute {
             self.has_attempt_failure = true;
             self.last_failure_origin = failure_origin(outcome).to_owned();
         }
-        self.emit_upstream_attempt(outcome, upstream_status, success);
+        self.emit_upstream_attempt(outcome, upstream_status, success, false);
         self.record_current_channel(success);
         if let (Some(provider), Some(original_model)) =
             (self.last_provider.clone(), self.last_original_model.clone())
@@ -1371,7 +1389,7 @@ impl NativeRoute {
         let detail = if self.last_detail.is_empty() {
             format!("All {} providers failed", self.request_model)
         } else {
-            self.last_detail.clone()
+            self.response_detail()
         };
         let status = if self.last_status == 0 {
             502
@@ -1432,7 +1450,13 @@ impl NativeRoute {
         );
     }
 
-    fn emit_upstream_attempt(&mut self, outcome: &Value, status: u16, success: bool) {
+    fn emit_upstream_attempt(
+        &mut self,
+        outcome: &Value,
+        status: u16,
+        success: bool,
+        provider_model_unavailable: bool,
+    ) {
         let Some(attempt) = self.last_attempt.clone() else {
             return;
         };
@@ -1462,6 +1486,7 @@ impl NativeRoute {
                 "status_code": status,
                 "success": success,
                 "outcome": attempt_outcome,
+                "provider_model_unavailable": provider_model_unavailable,
                 "error_sha256": error_sha256,
                 "duration_ms": duration_ms,
             }));
@@ -1494,6 +1519,7 @@ impl NativeRoute {
                 "semantic_status_code": outcome.get("status_code").and_then(Value::as_u64),
                 "attempt_success": success,
                 "attempt_outcome": attempt_outcome,
+                "provider_model_unavailable": provider_model_unavailable,
                 "status_origin": failure_origin(outcome),
                 "error_sha256": error_sha256,
                 "duration_ms": duration_ms,
@@ -2084,6 +2110,7 @@ pub async fn prepare_native_request(
         last_attempt: None,
         last_status: 502,
         last_detail: String::new(),
+        last_provider_model_unavailable: false,
         has_attempt_failure: false,
         last_failure_origin: String::new(),
         routing_attempts: 0,
@@ -3250,6 +3277,9 @@ fn remap_provider_status(status: u16, detail: &str) -> u16 {
     if detail.contains("User location is not supported for the API use.") {
         return 403;
     }
+    if is_provider_model_unavailable(status, detail) {
+        return 503;
+    }
     if detail.contains("<center><h1>400 Bad Request</h1></center>")
         || detail.contains("Provider API error: bad response status code 400")
         || status == 400 && is_model_pricing_unconfigured(detail)
@@ -3274,6 +3304,7 @@ pub(crate) fn classify_provider_failure(
     endpoint: &str,
     auto_retry: bool,
 ) -> ProviderFailurePolicy {
+    let provider_model_unavailable = is_provider_model_unavailable(original_status, detail);
     let status = remap_provider_status(original_status, detail);
     let codex_model_unsupported = status == 400
         && matches!(endpoint, "/v1/responses" | "/v1/responses/compact")
@@ -3289,8 +3320,66 @@ pub(crate) fn classify_provider_failure(
         status,
         retryable: auto_retry && (!request_scoped || codex_model_unsupported || azure_request),
         request_scoped,
+        provider_model_unavailable,
         force_quota_cooldown: codex_model_unsupported,
     }
+}
+
+fn is_provider_model_unavailable(status: u16, detail: &str) -> bool {
+    if !matches!(status, 400 | 404) {
+        return false;
+    }
+
+    const CODES: &[&str] = &[
+        "model_not_found",
+        "model_not_supported",
+        "model_unsupported",
+        "unknown_provider",
+        "unsupported_model",
+    ];
+    const MARKERS: &[&str] = &[
+        "unknown provider for model",
+        "no provider found for model",
+        "no provider available for model",
+        "model is not supported by this provider",
+    ];
+
+    let mut candidate = detail.to_owned();
+    for _ in 0..3 {
+        let parsed = serde_json::from_str::<Value>(&candidate).ok();
+        let (code, message) = if let Some(payload) = parsed.as_ref() {
+            let error = payload
+                .get("error")
+                .filter(|value| value.is_object())
+                .or_else(|| payload.get("detail").filter(|value| value.is_object()));
+            (
+                error
+                    .and_then(|value| value.get("code"))
+                    .and_then(Value::as_str),
+                error
+                    .and_then(|value| value.get("message"))
+                    .and_then(Value::as_str),
+            )
+        } else {
+            (None, Some(candidate.as_str()))
+        };
+
+        if code.is_some_and(|value| CODES.contains(&value.trim().to_ascii_lowercase().as_str())) {
+            return true;
+        }
+        if message.is_some_and(|value| {
+            let lower = value.to_ascii_lowercase();
+            MARKERS.iter().any(|marker| lower.contains(marker))
+        }) {
+            return true;
+        }
+
+        let Some(nested) = message.filter(|value| value.trim_start().starts_with('{')) else {
+            break;
+        };
+        candidate = nested.to_owned();
+    }
+    false
 }
 
 fn is_azure_provider(base_url: &str) -> bool {
@@ -3607,6 +3696,7 @@ mod tests {
             last_attempt: None,
             last_status: 502,
             last_detail: String::new(),
+            last_provider_model_unavailable: false,
             has_attempt_failure: false,
             last_failure_origin: String::new(),
             routing_attempts: 0,
@@ -4036,6 +4126,39 @@ mod tests {
         assert_eq!(pricing.status, 502);
         assert!(pricing.retryable);
 
+        let model_unavailable = classify_provider_failure(
+            400,
+            r#"{"error":{"code":"model_not_found","message":"unknown provider for model gpt-5.6-sol"}}"#,
+            Some(&base_provider),
+            "/v1/responses",
+            true,
+        );
+        assert_eq!(model_unavailable.status, 503);
+        assert!(model_unavailable.retryable);
+        assert!(!model_unavailable.request_scoped);
+        assert!(model_unavailable.provider_model_unavailable);
+
+        let wrapped_model_unavailable = classify_provider_failure(
+            400,
+            r#"{"error":{"message":"{\"error\":{\"code\":\"model_not_found\",\"message\":\"unknown provider for model gpt-5.6-sol\"}}"}}"#,
+            Some(&base_provider),
+            "/v1/responses",
+            true,
+        );
+        assert_eq!(wrapped_model_unavailable.status, 503);
+        assert!(wrapped_model_unavailable.retryable);
+
+        let ordinary_bad_request = classify_provider_failure(
+            400,
+            r#"{"error":{"code":"invalid_type","message":"messages: field required"}}"#,
+            Some(&base_provider),
+            "/v1/responses",
+            true,
+        );
+        assert_eq!(ordinary_bad_request.status, 400);
+        assert!(!ordinary_bad_request.retryable);
+        assert!(!ordinary_bad_request.provider_model_unavailable);
+
         let codex = classify_provider_failure(
             400,
             "model is not supported when using codex with a ChatGPT account",
@@ -4100,7 +4223,7 @@ mod tests {
         assert!(route.next_plan().await.unwrap().is_none());
 
         assert_eq!(route.last_status(), 503);
-        assert_eq!(route.last_detail(), "no available token");
+        assert_eq!(route.response_detail(), "no available token");
         assert_eq!(route.routing_attempts, 2);
         assert_eq!(route.routing_skips, 1);
         assert_eq!(route.upstream_attempts, 1);

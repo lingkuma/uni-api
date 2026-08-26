@@ -49,6 +49,20 @@ def test_provider_model_circuit_expires_and_success_resets_evidence():
     assert circuit.snapshot()["open_route_count"] == 0
 
 
+def test_provider_model_circuit_accepts_model_unavailable_400_only_for_that_route():
+    circuit = ProviderModelCircuitBreaker(
+        failure_threshold=2,
+        failure_window_seconds=120,
+        open_seconds=300,
+    )
+
+    assert circuit.record_failure("provider-a", "gpt-5.6-sol", 400) is False
+    assert circuit.record_failure("provider-a", "gpt-5.6-sol", 400) is True
+    assert circuit.is_open("provider-a", "gpt-5.6-sol") is True
+    assert circuit.is_open("provider-a", "gpt-5.5") is False
+    assert circuit.is_open("provider-b", "gpt-5.6-sol") is False
+
+
 def test_deterministic_failure_circuit_ignores_legacy_cooldown_exclusions():
     async def run():
         circuit = ProviderModelCircuitBreaker(
