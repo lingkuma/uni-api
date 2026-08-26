@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
@@ -15,6 +15,8 @@ use ring::rand::SystemRandom;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
 
 use crate::persistence::{ChannelStat, RequestStat};
@@ -272,7 +274,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         .native_responses_config
         .auto_retry_enabled(&headers)
         .await;
-    let (input, _image_reservations) = match prepare_image_inputs(&state, input).await {
+    let (input, image_reservations) = match prepare_image_inputs(&state, input).await {
         Ok(prepared) => prepared,
         Err((status, detail)) => return json_error(status, &detail),
     };
@@ -280,12 +282,171 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         .native_responses_config
         .prices_for_model(&request_model)
         .await;
+    let use_precommit_stream = path == "/v1/chat/completions"
+        && input
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        && resolved
+            .providers
+            .iter()
+            .any(|provider| provider_uses_responses_chat(provider));
+    let execution = AttemptLoop {
+        state,
+        started,
+        method,
+        uri,
+        path,
+        headers,
+        request_id,
+        trace_id,
+        client_ip,
+        api_key,
+        api_key_role,
+        request_model,
+        video_task_route,
+        providers: resolved.providers,
+        max_attempts,
+        auto_retry,
+        input,
+        image_reservations,
+        prompt_price,
+        completion_price,
+        precommit_comment_sent: use_precommit_stream,
+    };
+    if use_precommit_stream {
+        return precommit_chat_stream(execution);
+    }
+    run_attempt_loop(execution).await
+}
+
+struct AttemptLoop {
+    state: AppState,
+    started: Instant,
+    method: Method,
+    uri: Uri,
+    path: String,
+    headers: HeaderMap,
+    request_id: String,
+    trace_id: String,
+    client_ip: String,
+    api_key: String,
+    api_key_role: String,
+    request_model: String,
+    video_task_route: Option<VideoTaskRoute>,
+    providers: Vec<Arc<Provider>>,
+    max_attempts: usize,
+    auto_retry: bool,
+    input: PreparedInput,
+    image_reservations: Vec<MemoryReservation>,
+    prompt_price: f64,
+    completion_price: f64,
+    precommit_comment_sent: bool,
+}
+
+fn provider_uses_responses_chat(provider: &Provider) -> bool {
+    let engine = provider.engine.trim().to_ascii_lowercase();
+    engine == "codex"
+        || (matches!(
+            engine.as_str(),
+            "gpt" | "openrouter" | "azure" | "azure-databricks" | "cloudflare"
+        ) && provider
+            .base_url
+            .to_ascii_lowercase()
+            .contains("/responses"))
+}
+
+fn precommit_chat_stream(execution: AttemptLoop) -> Response<Body> {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+    tokio::spawn(async move {
+        if tx
+            .send(Ok(Bytes::from_static(b": uni-api-precommit\n\n")))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let response = run_attempt_loop(execution).await;
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let (parts, body) = response.into_parts();
+        if content_type.contains("text/event-stream") {
+            let mut body = body.into_data_stream();
+            while let Some(chunk) = body.next().await {
+                if tx.send(chunk.map_err(io::Error::other)).await.is_err() {
+                    return;
+                }
+            }
+            return;
+        }
+        let body = match to_bytes(body, UPSTREAM_ERROR_MAX_BYTES).await {
+            Ok(body) => body,
+            Err(error) => Bytes::from(
+                json!({"error":{"message":format!("read terminal provider response: {error}")}})
+                    .to_string(),
+            ),
+        };
+        let payload = serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| {
+            json!({"error":{
+                "message":String::from_utf8_lossy(&body),
+                "status_code":parts.status.as_u16(),
+            }})
+        });
+        let _ = tx
+            .send(Ok(Bytes::from(format!("data: {payload}\n\n"))))
+            .await;
+    });
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        "cache-control",
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response
+        .headers_mut()
+        .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+    response
+}
+
+async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
+    let AttemptLoop {
+        state,
+        started,
+        method,
+        uri,
+        path,
+        headers,
+        request_id,
+        trace_id,
+        client_ip,
+        api_key,
+        api_key_role,
+        request_model,
+        video_task_route,
+        providers,
+        max_attempts,
+        auto_retry,
+        input,
+        image_reservations: _image_reservations,
+        prompt_price,
+        completion_price,
+        precommit_comment_sent,
+    } = execution;
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_detail = String::from("No upstream attempt succeeded");
     let mut last_upstream_response = None;
 
     for attempt_index in 0..max_attempts {
-        let provider = resolved.providers[attempt_index % resolved.providers.len()].clone();
+        let provider = providers[attempt_index % providers.len()].clone();
         let Some(original_model) = provider.models.get(&request_model).cloned() else {
             continue;
         };
@@ -372,8 +533,145 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
             "started",
             None,
         );
-        match send_attempt(&state, &provider, prepared, &headers, &path).await {
+        match send_attempt(
+            &state,
+            &provider,
+            prepared,
+            &headers,
+            &path,
+            precommit_comment_sent,
+        )
+        .await
+        {
             Ok(success) => {
+                let AttemptSuccess {
+                    response,
+                    status,
+                    usage,
+                    stream_outcome,
+                    upstream_url,
+                } = success;
+                let request_stat = RequestStat {
+                    request_id: request_id.clone(),
+                    trace_id: trace_id.clone(),
+                    endpoint: path.clone(),
+                    client_ip: client_ip.clone(),
+                    process_time: started.elapsed().as_secs_f64(),
+                    first_response_time: attempt_started.elapsed().as_secs_f64(),
+                    provider: provider.name.to_string(),
+                    model: request_model.clone(),
+                    api_key: api_key.clone(),
+                    prompt_tokens: usage.0,
+                    completion_tokens: usage.1,
+                    total_tokens: usage.2,
+                    prompt_price,
+                    completion_price,
+                    timing_spans: json!({
+                        "runtime": "rust",
+                        "attempt_count": attempt_index + 1,
+                        "upstream_ms": attempt_started.elapsed().as_millis(),
+                    })
+                    .to_string(),
+                    ..RequestStat::default()
+                };
+                if let Some(stream_outcome) = stream_outcome {
+                    let outcome_state = state.clone();
+                    let outcome_provider = provider.clone();
+                    let outcome_original_model = original_model.clone();
+                    let outcome_provider_key = provider_key_raw.clone();
+                    let outcome_request_id = request_id.clone();
+                    let outcome_trace_id = trace_id.clone();
+                    let outcome_role = api_key_role.clone();
+                    let outcome_model = request_model.clone();
+                    let outcome_api_key = api_key.clone();
+                    let outcome_path = path.clone();
+                    let has_alternative = providers.len() > 1;
+                    tokio::spawn(async move {
+                        let outcome = stream_outcome.await.unwrap_or_else(|_| {
+                            provider_stream::StreamOutcome {
+                                usage: (0, 0, 0),
+                                success: false,
+                                status_code: 502,
+                                detail: "provider stream outcome was canceled".into(),
+                            }
+                        });
+                        let mut request_stat = request_stat;
+                        request_stat.process_time = started.elapsed().as_secs_f64();
+                        request_stat.prompt_tokens = outcome.usage.0;
+                        request_stat.completion_tokens = outcome.usage.1;
+                        request_stat.total_tokens = outcome.usage.2;
+                        request_stat.timing_spans = json!({
+                            "runtime": "rust",
+                            "attempt_count": attempt_index + 1,
+                            "upstream_ms": attempt_started.elapsed().as_millis(),
+                            "terminal": if outcome.success { "stream_completed" } else { "stream_failed" },
+                            "status_code": outcome.status_code,
+                        })
+                        .to_string();
+                        outcome_state.persistence.record_channel(ChannelStat {
+                            request_id: outcome_request_id.clone(),
+                            provider: outcome_provider.name.to_string(),
+                            model: outcome_model.clone(),
+                            api_key: outcome_api_key,
+                            provider_api_key: outcome_provider_key.clone(),
+                            success: outcome.success,
+                        });
+                        let recorded_status = if outcome.success {
+                            outcome_state
+                                .native_responses_config
+                                .reset_route_failure(&outcome_provider, &outcome_original_model)
+                                .await;
+                            status.as_u16()
+                        } else {
+                            let policy = classify_provider_failure(
+                                outcome.status_code,
+                                &outcome.detail,
+                                Some(&outcome_provider),
+                                &outcome_path,
+                                auto_retry,
+                            );
+                            if !policy.request_scoped || policy.force_quota_cooldown {
+                                outcome_state
+                                    .native_responses_config
+                                    .cool_failed_route(FailedRoute {
+                                        provider: &outcome_provider,
+                                        key: &outcome_provider_key,
+                                        original_model: &outcome_original_model,
+                                        has_alternative,
+                                        status: policy.status,
+                                        detail: &outcome.detail,
+                                        force_quota_cooldown: policy.force_quota_cooldown,
+                                    })
+                                    .await;
+                            }
+                            if outcome_provider.engine.eq_ignore_ascii_case("codex")
+                                && outcome_provider_key.contains(',')
+                                && matches!(policy.status, 401..=403)
+                            {
+                                outcome_state.codex_oauth.clear(&outcome_provider_key).await;
+                            }
+                            policy.status
+                        };
+                        outcome_state.persistence.record_request(request_stat);
+                        emit_attempt(
+                            &outcome_request_id,
+                            &outcome_trace_id,
+                            &outcome_role,
+                            attempt_index,
+                            &outcome_provider,
+                            &outcome_model,
+                            &outcome_original_model,
+                            &upstream_url,
+                            if outcome.success {
+                                "completed"
+                            } else {
+                                "failed"
+                            },
+                            Some(recorded_status),
+                        );
+                    });
+                    return response;
+                }
                 state.persistence.record_channel(ChannelStat {
                     request_id: request_id.clone(),
                     provider: provider.name.to_string(),
@@ -386,42 +684,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                     .native_responses_config
                     .reset_route_failure(&provider, &original_model)
                     .await;
-                let mut request_stat = RequestStat {
-                    request_id: request_id.clone(),
-                    trace_id: trace_id.clone(),
-                    endpoint: path.clone(),
-                    client_ip: client_ip.clone(),
-                    process_time: started.elapsed().as_secs_f64(),
-                    first_response_time: attempt_started.elapsed().as_secs_f64(),
-                    provider: provider.name.to_string(),
-                    model: request_model.clone(),
-                    api_key: api_key.clone(),
-                    prompt_tokens: success.usage.0,
-                    completion_tokens: success.usage.1,
-                    total_tokens: success.usage.2,
-                    prompt_price,
-                    completion_price,
-                    timing_spans: json!({
-                        "runtime": "rust",
-                        "attempt_count": attempt_index + 1,
-                        "upstream_ms": attempt_started.elapsed().as_millis(),
-                    })
-                    .to_string(),
-                    ..RequestStat::default()
-                };
-                if let Some(usage_completion) = success.usage_completion {
-                    let persistence = state.persistence.clone();
-                    tokio::spawn(async move {
-                        if let Ok(usage) = usage_completion.await {
-                            request_stat.prompt_tokens = usage.0;
-                            request_stat.completion_tokens = usage.1;
-                            request_stat.total_tokens = usage.2;
-                        }
-                        persistence.record_request(request_stat);
-                    });
-                } else {
-                    state.persistence.record_request(request_stat);
-                }
+                state.persistence.record_request(request_stat);
                 emit_attempt(
                     &request_id,
                     &trace_id,
@@ -430,11 +693,11 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                     &provider,
                     &request_model,
                     &original_model,
-                    &success.upstream_url,
+                    &upstream_url,
                     "completed",
-                    Some(success.status.as_u16()),
+                    Some(status.as_u16()),
                 );
-                return success.response;
+                return response;
             }
             Err(mut failure) => {
                 let policy = classify_provider_failure(
@@ -469,7 +732,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
                             provider: &provider,
                             key: &provider_key_raw,
                             original_model: &original_model,
-                            has_alternative: resolved.providers.len() > 1,
+                            has_alternative: providers.len() > 1,
                             status: failure.status.as_u16(),
                             detail: &failure.detail,
                             force_quota_cooldown: policy.force_quota_cooldown,
@@ -717,7 +980,16 @@ pub(crate) async fn run_moderation_preflight(
             &request_id(headers),
         )
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, &error))?;
-        match send_attempt(state, &provider, prepared, headers, "/v1/moderations").await {
+        match send_attempt(
+            state,
+            &provider,
+            prepared,
+            headers,
+            "/v1/moderations",
+            false,
+        )
+        .await
+        {
             Ok(success) => {
                 let bytes = to_bytes(success.response.into_body(), 4 * 1024 * 1024)
                     .await
@@ -1839,7 +2111,7 @@ struct AttemptSuccess {
     response: Response<Body>,
     status: StatusCode,
     usage: (i64, i64, i64),
-    usage_completion: Option<tokio::sync::oneshot::Receiver<(i64, i64, i64)>>,
+    stream_outcome: Option<tokio::sync::oneshot::Receiver<provider_stream::StreamOutcome>>,
     upstream_url: String,
 }
 
@@ -1856,6 +2128,7 @@ async fn send_attempt(
     mut prepared: PreparedAttempt,
     incoming_headers: &HeaderMap,
     endpoint: &str,
+    precommit_comment_sent: bool,
 ) -> Result<AttemptSuccess, AttemptFailure> {
     let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
     let http1_only = provider.engine.eq_ignore_ascii_case("codex");
@@ -2034,7 +2307,7 @@ async fn send_attempt(
             response: output,
             status,
             usage: (0, 0, 0),
-            usage_completion: None,
+            stream_outcome: None,
             upstream_url: prepared.url,
         });
     }
@@ -2061,15 +2334,36 @@ async fn send_attempt(
         } else {
             StreamOutputProtocol::Chat
         };
-        let mut translation = provider_stream::translate(
-            response,
-            protocol,
-            output_protocol,
-            prepared.request_model.clone(),
-            prepared.chat_stream_include_usage,
-            timeouts.idle,
-            timeouts.total,
-        );
+        let mut translation = if prepared.adapter == ResponseAdapter::ResponsesToChat {
+            provider_stream::translate_responses_to_chat(
+                response,
+                output_protocol,
+                prepared.request_model.clone(),
+                prepared.chat_stream_include_usage,
+                timeouts.first_byte,
+                timeouts.idle,
+                timeouts.total,
+                !precommit_comment_sent,
+            )
+            .await
+            .map_err(|failure| AttemptFailure {
+                status: StatusCode::from_u16(failure.status_code)
+                    .unwrap_or(StatusCode::BAD_GATEWAY),
+                detail: failure.detail,
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?
+        } else {
+            provider_stream::translate(
+                response,
+                protocol,
+                output_protocol,
+                prepared.request_model.clone(),
+                prepared.chat_stream_include_usage,
+                timeouts.idle,
+                timeouts.total,
+            )
+        };
         translation
             .response
             .headers_mut()
@@ -2078,7 +2372,7 @@ async fn send_attempt(
             response: translation.response,
             status,
             usage: (0, 0, 0),
-            usage_completion: Some(translation.usage),
+            stream_outcome: Some(translation.outcome),
             upstream_url: prepared.url,
         });
     }
@@ -2108,7 +2402,7 @@ async fn send_attempt(
             response: output,
             status,
             usage,
-            usage_completion: None,
+            stream_outcome: None,
             upstream_url: prepared.url,
         });
     }
@@ -2190,7 +2484,7 @@ async fn send_attempt(
         response: output,
         status: StatusCode::OK,
         usage,
-        usage_completion: None,
+        stream_outcome: None,
         upstream_url: prepared.url,
     })
 }

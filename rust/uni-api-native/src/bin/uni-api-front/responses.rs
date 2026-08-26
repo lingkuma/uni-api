@@ -1990,7 +1990,7 @@ fn semantic_failure_outcome(
     outcome
 }
 
-fn responses_semantic_error(payload: &Value, event_type: &str) -> (u16, String) {
+pub(crate) fn responses_semantic_error(payload: &Value, event_type: &str) -> (u16, String) {
     let error = if event_type.eq_ignore_ascii_case("response.failed") {
         payload.pointer("/response/error")
     } else {

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::pin::Pin;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -8,7 +9,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bytes::Bytes;
 use crc32fast::hash as crc32;
-use futures_util::{Stream, StreamExt};
+use futures_util::{stream, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -35,8 +36,24 @@ pub enum OutputProtocol {
 
 pub struct Translation {
     pub response: Response<Body>,
-    pub usage: oneshot::Receiver<(i64, i64, i64)>,
+    pub outcome: oneshot::Receiver<StreamOutcome>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamOutcome {
+    pub usage: (i64, i64, i64),
+    pub success: bool,
+    pub status_code: u16,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrecommitFailure {
+    pub status_code: u16,
+    pub detail: String,
+}
+
+type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
 
 #[derive(Clone, Copy)]
 struct StreamTimeouts {
@@ -66,9 +83,152 @@ pub fn translate(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    spawn_translation(
+        status,
+        content_type,
+        Box::pin(response.bytes_stream()),
+        protocol,
+        output_protocol,
+        model,
+        include_usage,
+        idle_timeout_seconds,
+        total_timeout_seconds,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn translate_responses_to_chat(
+    response: reqwest::Response,
+    output_protocol: OutputProtocol,
+    model: String,
+    include_usage: bool,
+    first_byte_timeout_seconds: Option<f64>,
+    idle_timeout_seconds: Option<f64>,
+    total_timeout_seconds: Option<f64>,
+    emit_precommit_comment: bool,
+) -> Result<Translation, PrecommitFailure> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut upstream: UpstreamStream = Box::pin(response.bytes_stream());
+    let started = tokio::time::Instant::now();
+    let first_deadline = positive_duration(first_byte_timeout_seconds).map(|value| started + value);
+    let total_deadline = positive_duration(total_timeout_seconds).map(|value| started + value);
+    let precommit_deadline = match (first_deadline, total_deadline) {
+        (Some(first), Some(total)) => Some(first.min(total)),
+        (Some(first), None) => Some(first),
+        (None, Some(total)) => Some(total),
+        (None, None) => None,
+    };
+    let idle = positive_duration(idle_timeout_seconds);
+    let mut buffer = Vec::new();
+
+    loop {
+        while let Some((end, separator)) = next_event_boundary(&buffer) {
+            let event = buffer.drain(..end).collect::<Vec<_>>();
+            buffer.drain(..separator);
+            match classify_responses_precommit_event(&event)? {
+                PrecommitDecision::Ignore => {}
+                PrecommitDecision::Commit => {
+                    let mut primed = event;
+                    primed.extend_from_slice(b"\n\n");
+                    primed.extend_from_slice(&buffer);
+                    let upstream = stream::iter([Ok(Bytes::from(primed))])
+                        .chain(upstream)
+                        .boxed();
+                    return Ok(spawn_translation(
+                        status,
+                        content_type,
+                        upstream,
+                        Protocol::Responses,
+                        output_protocol,
+                        model,
+                        include_usage,
+                        idle_timeout_seconds,
+                        total_timeout_seconds,
+                        emit_precommit_comment,
+                    ));
+                }
+            }
+        }
+        if buffer.len() > MAX_STREAM_FRAME_BYTES {
+            return Err(PrecommitFailure {
+                status_code: 502,
+                detail: "upstream Responses SSE event exceeded 1 MiB before commit".into(),
+            });
+        }
+        let next = next_upstream_chunk(&mut upstream, idle, precommit_deadline)
+            .await
+            .map_err(|detail| PrecommitFailure {
+                status_code: 504,
+                detail,
+            })?;
+        match next {
+            Some(Ok(chunk)) => buffer.extend_from_slice(&chunk),
+            Some(Err(error)) => {
+                return Err(PrecommitFailure {
+                    status_code: 502,
+                    detail: format!("upstream Responses stream failed before commit: {error}"),
+                });
+            }
+            None => {
+                if !buffer.iter().all(u8::is_ascii_whitespace) {
+                    match classify_responses_precommit_event(&buffer)? {
+                        PrecommitDecision::Commit => {
+                            let upstream = stream::iter([Ok(Bytes::from(buffer))]).boxed();
+                            return Ok(spawn_translation(
+                                status,
+                                content_type,
+                                upstream,
+                                Protocol::Responses,
+                                output_protocol,
+                                model,
+                                include_usage,
+                                idle_timeout_seconds,
+                                total_timeout_seconds,
+                                emit_precommit_comment,
+                            ));
+                        }
+                        PrecommitDecision::Ignore => {}
+                    }
+                }
+                return Err(PrecommitFailure {
+                    status_code: 502,
+                    detail:
+                        "upstream Responses stream ended before real output or a completed terminal"
+                            .into(),
+                });
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_translation(
+    status: reqwest::StatusCode,
+    content_type: String,
+    stream: UpstreamStream,
+    protocol: Protocol,
+    output_protocol: OutputProtocol,
+    model: String,
+    include_usage: bool,
+    idle_timeout_seconds: Option<f64>,
+    total_timeout_seconds: Option<f64>,
+    emit_precommit_comment: bool,
+) -> Translation {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
-    let (usage_tx, usage_rx) = oneshot::channel();
+    let (outcome_tx, outcome_rx) = oneshot::channel();
     tokio::spawn(async move {
+        if emit_precommit_comment {
+            let _ = tx
+                .send(Ok(Bytes::from_static(b": uni-api-precommit\n\n")))
+                .await;
+        }
         let options = TranslationOptions {
             include_usage,
             timeouts: StreamTimeouts {
@@ -77,7 +237,7 @@ pub fn translate(
             },
         };
         let result = run_translation(
-            response,
+            stream,
             protocol,
             output_protocol,
             &model,
@@ -86,8 +246,8 @@ pub fn translate(
             options,
         )
         .await;
-        let usage = match result {
-            Ok(usage) => usage,
+        let outcome = match result {
+            Ok(outcome) => outcome,
             Err(error) => {
                 let payload = match output_protocol {
                     OutputProtocol::Chat => json!({"error":{"message":error}}),
@@ -100,13 +260,18 @@ pub fn translate(
                     }),
                 };
                 let _ = send_wire(&tx, &payload, output_protocol).await;
-                (0, 0, 0)
+                StreamOutcome {
+                    usage: (0, 0, 0),
+                    success: false,
+                    status_code: 502,
+                    detail: error,
+                }
             }
         };
-        if output_protocol == OutputProtocol::Chat {
+        if output_protocol == OutputProtocol::Chat && outcome.success {
             let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
         }
-        let _ = usage_tx.send(usage);
+        let _ = outcome_tx.send(outcome);
     });
     let mut output = Response::new(Body::from_stream(ReceiverStream::new(rx)));
     *output.status_mut() = status;
@@ -120,25 +285,24 @@ pub fn translate(
     );
     Translation {
         response: output,
-        usage: usage_rx,
+        outcome: outcome_rx,
     }
 }
 
 async fn run_translation(
-    response: reqwest::Response,
+    mut stream: UpstreamStream,
     protocol: Protocol,
     output_protocol: OutputProtocol,
     model: &str,
     content_type: &str,
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     options: TranslationOptions,
-) -> Result<(i64, i64, i64), String> {
+) -> Result<StreamOutcome, String> {
     let mut state = StreamState::new_with_options(model, output_protocol, options.include_usage);
     let timeouts = options.timeouts;
     for event in state.start_chunks() {
         send_wire(tx, &event, output_protocol).await?;
     }
-    let mut stream = response.bytes_stream();
     let total_deadline = timeouts
         .total
         .map(|timeout| tokio::time::Instant::now() + timeout);
@@ -157,7 +321,7 @@ async fn run_translation(
             return Err("AWS event-stream ended with an incomplete frame".into());
         }
         state.finish_if_needed(tx).await?;
-        return Ok(state.usage());
+        return Ok(state.outcome());
     }
 
     let sse = content_type.contains("text/event-stream")
@@ -172,11 +336,14 @@ async fn run_translation(
         {
             buffer.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
             drain_sse_events(&mut buffer, protocol, &mut state, tx).await?;
+            if protocol == Protocol::Responses && state.terminal {
+                break;
+            }
             if buffer.len() > MAX_STREAM_FRAME_BYTES {
                 return Err("upstream SSE event exceeded 1 MiB".into());
             }
         }
-        if !buffer.iter().all(u8::is_ascii_whitespace) {
+        if !state.terminal && !buffer.iter().all(u8::is_ascii_whitespace) {
             drain_final_sse_event(&mut buffer, protocol, &mut state, tx).await?;
         }
     } else if protocol == Protocol::Cohere {
@@ -206,7 +373,7 @@ async fn run_translation(
         framer.finish()?;
     }
     state.finish_if_needed(tx).await?;
-    Ok(state.usage())
+    Ok(state.outcome())
 }
 
 fn positive_duration(value: Option<f64>) -> Option<Duration> {
@@ -252,6 +419,9 @@ async fn drain_sse_events(
         let event = buffer.drain(..end).collect::<Vec<_>>();
         buffer.drain(..separator);
         process_sse_event(&event, protocol, state, tx).await?;
+        if protocol == Protocol::Responses && state.terminal {
+            break;
+        }
     }
     Ok(())
 }
@@ -276,6 +446,170 @@ fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrecommitDecision {
+    Ignore,
+    Commit,
+}
+
+fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision, PrecommitFailure> {
+    let text = std::str::from_utf8(event).map_err(|_| PrecommitFailure {
+        status_code: 502,
+        detail: "upstream Responses SSE was not UTF-8 before commit".into(),
+    })?;
+    let mut data = String::new();
+    let mut declared_event = None;
+    let mut comment_only = false;
+    for line in text.lines() {
+        if line.starts_with(':') {
+            comment_only = true;
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            declared_event = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value.trim_start());
+        } else if !line.trim().is_empty() {
+            comment_only = false;
+        }
+    }
+    if data.trim().is_empty() && comment_only {
+        return Ok(PrecommitDecision::Ignore);
+    }
+    if data.trim().is_empty() {
+        return Ok(PrecommitDecision::Ignore);
+    }
+    if data.trim() == "[DONE]" {
+        return Err(PrecommitFailure {
+            status_code: 502,
+            detail: "upstream Responses stream emitted [DONE] before a terminal event".into(),
+        });
+    }
+    let payload: Value = serde_json::from_str(&data).map_err(|error| PrecommitFailure {
+        status_code: 502,
+        detail: format!("decode upstream Responses precommit event: {error}"),
+    })?;
+    let event_type =
+        payload
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PrecommitFailure {
+                status_code: 502,
+                detail: "upstream Responses precommit event is missing a string type".into(),
+            })?;
+    if declared_event.is_some_and(|declared| declared != event_type) {
+        return Err(PrecommitFailure {
+            status_code: 502,
+            detail: format!(
+                "upstream Responses event field {declared_event:?} does not match payload type {event_type:?}"
+            ),
+        });
+    }
+    match event_type {
+        "response.created" | "response.in_progress" | "response.queued" | "keepalive" => {
+            Ok(PrecommitDecision::Ignore)
+        }
+        "response.failed" | "error" => {
+            validate_responses_terminal(event_type, &payload)?;
+            let (status_code, detail) =
+                crate::responses::responses_semantic_error(&payload, event_type);
+            Err(PrecommitFailure {
+                status_code,
+                detail,
+            })
+        }
+        "response.completed" => {
+            validate_responses_terminal(event_type, &payload)?;
+            if !responses_completed_is_valid(&payload) {
+                if payload
+                    .pointer("/response/error")
+                    .is_some_and(|error| !error.is_null())
+                    || payload
+                        .pointer("/response/status")
+                        .and_then(Value::as_str)
+                        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
+                {
+                    let (status_code, detail) =
+                        crate::responses::responses_semantic_error(&payload, "response.failed");
+                    return Err(PrecommitFailure {
+                        status_code,
+                        detail,
+                    });
+                }
+                return Err(PrecommitFailure {
+                    status_code: 502,
+                    detail: "upstream Responses completed terminal is not valid".into(),
+                });
+            }
+            Ok(PrecommitDecision::Commit)
+        }
+        "response.incomplete" => Err(PrecommitFailure {
+            status_code: 502,
+            detail: "upstream Responses request ended incomplete before commit".into(),
+        }),
+        _ if responses_event_has_real_output(event_type, &payload) => Ok(PrecommitDecision::Commit),
+        _ => Ok(PrecommitDecision::Ignore),
+    }
+}
+
+fn responses_completed_is_valid(payload: &Value) -> bool {
+    payload
+        .pointer("/response/status")
+        .and_then(Value::as_str)
+        .is_none_or(|status| status.eq_ignore_ascii_case("completed"))
+        && payload
+            .pointer("/response/error")
+            .is_none_or(Value::is_null)
+}
+
+fn validate_responses_terminal(event_type: &str, payload: &Value) -> Result<(), PrecommitFailure> {
+    if event_type.starts_with("response.") && !payload.get("response").is_some_and(Value::is_object)
+    {
+        return Err(PrecommitFailure {
+            status_code: 502,
+            detail: format!("upstream Responses {event_type} event is missing response"),
+        });
+    }
+    if event_type == "error" && payload.get("error").is_none_or(Value::is_null) {
+        return Err(PrecommitFailure {
+            status_code: 502,
+            detail: "upstream Responses error event is missing error".into(),
+        });
+    }
+    Ok(())
+}
+
+fn responses_event_has_real_output(event_type: &str, payload: &Value) -> bool {
+    match event_type {
+        "response.output_text.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_text.delta"
+        | "response.function_call_arguments.delta" => payload
+            .get("delta")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty()),
+        "response.output_item.added" => payload
+            .get("item")
+            .filter(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("function_call" | "tool_call")
+                )
+            })
+            .is_some_and(|item| {
+                ["name", "arguments", "call_id"].iter().any(|field| {
+                    item.get(*field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                })
+            }),
+        _ => false,
+    }
 }
 
 async fn process_sse_event(
@@ -410,6 +744,7 @@ struct StreamState {
     completion_tokens: i64,
     chat_usage: Option<Value>,
     terminal: bool,
+    failure: Option<PrecommitFailure>,
     output_protocol: OutputProtocol,
     include_usage: bool,
     responses: ResponsesOutputState,
@@ -432,6 +767,7 @@ impl StreamState {
             completion_tokens: 0,
             chat_usage: None,
             terminal: false,
+            failure: None,
             output_protocol,
             include_usage,
             responses: ResponsesOutputState::new(model, created),
@@ -529,7 +865,7 @@ impl StreamState {
                     None,
                 )]
             }
-            "response.completed" => {
+            "response.completed" if responses_completed_is_valid(value) => {
                 let usage = responses_usage_to_chat(value.pointer("/response/usage"));
                 self.prompt_tokens = number(usage.get("prompt_tokens"));
                 self.completion_tokens = number(usage.get("completion_tokens"));
@@ -540,11 +876,25 @@ impl StreamState {
                     "tool_calls"
                 })
             }
-            "response.failed" | "error" => vec![
-                json!({"error":{"message":value.pointer("/response/error/message").or_else(|| value.pointer("/error/message")).and_then(Value::as_str).unwrap_or("upstream Responses request failed")}}),
-            ],
+            "response.completed" => self.responses_failure(value, "response.failed"),
+            "response.failed" | "error" => self.responses_failure(value, event),
             _ => Vec::new(),
         }
+    }
+
+    fn responses_failure(&mut self, value: &Value, event_type: &str) -> Vec<Value> {
+        let (status_code, detail) = crate::responses::responses_semantic_error(value, event_type);
+        self.terminal = true;
+        self.failure = Some(PrecommitFailure {
+            status_code,
+            detail: detail.clone(),
+        });
+        vec![json!({"error":{
+            "message":detail,
+            "type":value.pointer("/response/error/type").or_else(|| value.pointer("/error/type")).cloned().unwrap_or(Value::String("upstream_error".into())),
+            "code":value.pointer("/response/error/code").or_else(|| value.pointer("/error/code")).cloned().unwrap_or(Value::Null),
+            "status_code":status_code,
+        }})]
     }
 
     fn gemini(&mut self, value: &Value) -> Vec<Value> {
@@ -862,6 +1212,23 @@ impl StreamState {
             self.completion_tokens,
             self.prompt_tokens + self.completion_tokens,
         )
+    }
+
+    fn outcome(&self) -> StreamOutcome {
+        match &self.failure {
+            Some(failure) => StreamOutcome {
+                usage: self.usage(),
+                success: false,
+                status_code: failure.status_code,
+                detail: failure.detail.clone(),
+            },
+            None => StreamOutcome {
+                usage: self.usage(),
+                success: true,
+                status_code: 200,
+                detail: String::new(),
+            },
+        }
     }
 
     async fn finish_if_needed(
@@ -1484,6 +1851,184 @@ impl JsonObjectFramer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    async fn mock_sse_response(body: &'static str) -> reqwest::Response {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        reqwest::get(format!("http://{address}")).await.unwrap()
+    }
+
+    #[test]
+    fn responses_precommit_ignores_structural_events_and_comments() {
+        for event in [
+            ": provider heartbeat",
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}",
+            "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{}}",
+            "event: response.queued\ndata: {\"type\":\"response.queued\",\"response\":{}}",
+            "event: keepalive\ndata: {\"type\":\"keepalive\",\"sequence_number\":0}",
+        ] {
+            assert_eq!(
+                classify_responses_precommit_event(event.as_bytes()).unwrap(),
+                PrecommitDecision::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn responses_precommit_maps_rate_limit_failure_to_429() {
+        let failure = classify_responses_precommit_event(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"Concurrency limit exceeded for account, please retry later\"}}}",
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.status_code, 429);
+        assert_eq!(
+            failure.detail,
+            "Concurrency limit exceeded for account, please retry later"
+        );
+    }
+
+    #[test]
+    fn responses_precommit_commits_only_real_output_or_completed() {
+        for event in [
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}",
+            "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}",
+        ] {
+            assert_eq!(
+                classify_responses_precommit_event(event.as_bytes()).unwrap(),
+                PrecommitDecision::Commit
+            );
+        }
+        assert_eq!(
+            classify_responses_precommit_event(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\"}"
+            )
+            .unwrap(),
+            PrecommitDecision::Ignore
+        );
+        assert_eq!(
+            classify_responses_precommit_event(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"in_progress\"}}"
+            )
+            .unwrap_err()
+            .status_code,
+            502
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_precommit_discards_provider_priming_frames() {
+        let response = mock_sse_response(
+            ": provider heartbeat\n\n\
+             event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n\
+             event: keepalive\ndata: {\"type\":\"keepalive\",\"sequence_number\":0}\n\n\
+             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n\
+             event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        )
+        .await;
+        let translation = translate_responses_to_chat(
+            response,
+            OutputProtocol::Chat,
+            "public-model".into(),
+            false,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(translation.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let outcome = translation.outcome.await.unwrap();
+        let wire = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(wire.starts_with(": uni-api-precommit\n\n"));
+        assert!(wire.contains("\"content\":\"hello\""));
+        assert!(wire.contains("\"finish_reason\":\"stop\""));
+        assert!(wire.ends_with("data: [DONE]\n\n"));
+        assert!(!wire.contains("response.created"));
+        assert!(!wire.contains("provider heartbeat"));
+        assert!(!wire.contains("\"type\":\"keepalive\""));
+        assert!(outcome.success);
+        assert_eq!(outcome.usage, (1, 1, 2));
+    }
+
+    #[tokio::test]
+    async fn responses_precommit_returns_semantic_failure_before_response_commit() {
+        let response = mock_sse_response(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n\
+             event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"Concurrency limit exceeded for account, please retry later\"}}}\n\n",
+        )
+        .await;
+        let failure = match translate_responses_to_chat(
+            response,
+            OutputProtocol::Chat,
+            "public-model".into(),
+            false,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        {
+            Ok(_) => panic!("semantic failure must not commit a provider response"),
+            Err(failure) => failure,
+        };
+
+        assert_eq!(failure.status_code, 429);
+        assert_eq!(
+            failure.detail,
+            "Concurrency limit exceeded for account, please retry later"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_failure_terminal_has_no_synthetic_stop_usage_or_done() {
+        let upstream: UpstreamStream = stream::iter([Ok(Bytes::from_static(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"Concurrency limit exceeded for account, please retry later\"}}}\n\n",
+        ))])
+        .boxed();
+        let translation = spawn_translation(
+            reqwest::StatusCode::OK,
+            "text/event-stream".into(),
+            upstream,
+            Protocol::Responses,
+            OutputProtocol::Chat,
+            "public-model".into(),
+            true,
+            None,
+            None,
+            true,
+        );
+        let body = axum::body::to_bytes(translation.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let outcome = translation.outcome.await.unwrap();
+        let wire = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(wire.starts_with(": uni-api-precommit\n\n"));
+        assert!(wire.contains("Concurrency limit exceeded for account"));
+        assert!(!wire.contains("finish_reason"));
+        assert!(!wire.contains("\"usage\""));
+        assert!(!wire.contains("[DONE]"));
+        assert!(!outcome.success);
+        assert_eq!(outcome.status_code, 429);
+    }
 
     #[test]
     fn gemini_stream_maps_text_tools_and_usage() {
