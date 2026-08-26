@@ -608,8 +608,52 @@ fn responses_event_has_real_output(event_type: &str, payload: &Value) -> bool {
                         .is_some_and(|value| !value.is_empty())
                 })
             }),
+        "response.output_item.done" => payload.get("item").is_some_and(item_has_real_output),
+        "response.content_part.added" | "response.content_part.done" => {
+            payload.get("part").is_some_and(|part| {
+                ["text", "refusal"].iter().any(|field| {
+                    part.get(*field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                })
+            })
+        }
+        event_type if event_type.starts_with("response.") && event_type.ends_with(".done") => {
+            ["text", "refusal", "arguments"].iter().any(|field| {
+                payload
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            })
+        }
         _ => false,
     }
+}
+
+fn item_has_real_output(item: &Value) -> bool {
+    if item
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                ["text", "refusal"].iter().any(|field| {
+                    part.get(*field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                })
+            })
+        })
+    {
+        return true;
+    }
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call" | "tool_call")
+    ) && ["name", "arguments", "call_id"].iter().any(|field| {
+        item.get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    })
 }
 
 async fn process_sse_event(
@@ -1904,6 +1948,8 @@ mod tests {
             "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}",
             "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}",
             "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}",
+            "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"text\":\"hello\"}",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{}\"}}",
             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}",
         ] {
             assert_eq!(
