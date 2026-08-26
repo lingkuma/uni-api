@@ -1,6 +1,7 @@
 mod codex_oauth;
 mod config;
 mod generic_api;
+mod hedging;
 mod idempotency;
 mod native_api;
 mod persistence;

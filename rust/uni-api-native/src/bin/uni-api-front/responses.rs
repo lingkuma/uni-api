@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::hedging::{HedgeEvent, HedgeScheduler, HedgeTrigger};
 use crate::idempotency;
 use crate::proxy::{filtered_response_headers, json_error, AppState};
 use crate::responses_item_ids::{event_item_id_needs_normalization, ResponsesItemIdNormalizer};
@@ -242,12 +243,6 @@ enum PreflightResult {
     Started(ActiveAttempt),
 }
 
-enum HedgeSignal {
-    Trigger,
-    Started { plan: Plan, active: ActiveAttempt },
-    Retry { plan: Plan, outcome: Value },
-}
-
 enum Coordinator {
     Python { session_id: String },
     Native { route: NativeRoute },
@@ -318,28 +313,26 @@ impl Coordinator {
 }
 
 fn spawn_hedge_attempt(
+    scheduler: &mut HedgeScheduler<String, (Plan, ActiveAttempt), (Plan, Value)>,
     state: AppState,
     plan: Plan,
-    sender: mpsc::UnboundedSender<HedgeSignal>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let result =
-            preflight_attempt_with_trigger(&state, plan.clone(), false, Some(&sender)).await;
-        let signal = match result {
-            Ok(PreflightResult::Started(active)) => HedgeSignal::Started { plan, active },
-            Ok(PreflightResult::Retry(outcome)) => HedgeSignal::Retry { plan, outcome },
-            Err(error) => HedgeSignal::Retry {
+) {
+    let attempt_id = plan.attempt_id.clone();
+    scheduler.spawn(attempt_id, move |trigger| async move {
+        match preflight_attempt_with_trigger(&state, plan.clone(), false, Some(&trigger)).await {
+            Ok(PreflightResult::Started(active)) => Ok((plan, active)),
+            Ok(PreflightResult::Retry(outcome)) => Err((plan, outcome)),
+            Err(error) => Err((
                 plan,
-                outcome: json!({
+                json!({
                     "kind": "protocol_error",
                     "status_code": 502,
                     "detail": error,
                     "committed": false,
                 }),
-            },
-        };
-        let _ = sender.send(signal);
-    })
+            )),
+        }
+    });
 }
 
 async fn preflight_native_hedged(
@@ -347,53 +340,47 @@ async fn preflight_native_hedged(
     route: &mut NativeRoute,
 ) -> Result<Option<ActiveAttempt>, String> {
     let max_inflight = route.hedge_slots().max(1);
-    let (sender, mut receiver) = mpsc::unbounded_channel();
-    let mut running = HashMap::<String, tokio::task::JoinHandle<()>>::new();
+    let mut scheduler = HedgeScheduler::new(max_inflight);
 
     let Some(plan) = route.next_plan().await? else {
         return Ok(None);
     };
-    let attempt_id = plan.attempt_id.clone();
-    let handle = spawn_hedge_attempt(state.clone(), plan, sender.clone());
-    running.insert(attempt_id, handle);
+    spawn_hedge_attempt(&mut scheduler, state.clone(), plan);
 
-    while let Some(signal) = receiver.recv().await {
-        match signal {
-            HedgeSignal::Trigger => {
+    loop {
+        match scheduler.next_event().await {
+            HedgeEvent::Triggered { key: _ } => {
                 route.record_hedge_trigger();
-                if running.len() < max_inflight {
+                if scheduler.has_capacity() {
                     if let Some(next) = route.next_plan().await? {
-                        let attempt_id = next.attempt_id.clone();
-                        let handle = spawn_hedge_attempt(state.clone(), next, sender.clone());
-                        running.insert(attempt_id, handle);
+                        spawn_hedge_attempt(&mut scheduler, state.clone(), next);
                     }
                 }
             }
-            HedgeSignal::Started { plan, active } => {
-                route.record_hedge_cancellations(running.len().saturating_sub(1));
-                for (_, handle) in running.drain() {
-                    handle.abort();
-                }
+            HedgeEvent::Succeeded {
+                key: _,
+                output: (plan, active),
+            } => {
+                route.record_hedge_cancellations(scheduler.cancel_remaining().len());
                 route.set_current_plan(&plan);
                 return Ok(Some(active));
             }
-            HedgeSignal::Retry { plan, outcome } => {
-                running.remove(&plan.attempt_id);
+            HedgeEvent::Failed {
+                key: _,
+                failure: (plan, outcome),
+            } => {
                 let retryable = route.record_failure_for(&plan, &outcome).await;
-                if retryable && running.len() < max_inflight {
+                if retryable && scheduler.has_capacity() {
                     if let Some(next) = route.next_plan().await? {
-                        let attempt_id = next.attempt_id.clone();
-                        let handle = spawn_hedge_attempt(state.clone(), next, sender.clone());
-                        running.insert(attempt_id, handle);
+                        spawn_hedge_attempt(&mut scheduler, state.clone(), next);
                     }
                 }
-                if running.is_empty() {
+                if scheduler.is_empty() {
                     return Ok(None);
                 }
             }
         }
     }
-    Ok(None)
 }
 
 pub async fn serve_native(
@@ -796,7 +783,7 @@ async fn preflight_attempt_with_trigger(
     state: &AppState,
     plan: Plan,
     keepalive_already_sent: bool,
-    trigger: Option<&mpsc::UnboundedSender<HedgeSignal>>,
+    trigger: Option<&HedgeTrigger<String>>,
 ) -> Result<PreflightResult, String> {
     let client = state
         .upstream_client(
@@ -846,7 +833,7 @@ async fn preflight_attempt_with_trigger(
                     .map_err(|error| format!("upstream response headers failed: {error}"))?,
                 _ = tokio::time::sleep_until(first_deadline.expect("checked first deadline")) => {
                     hedge_triggered = true;
-                    let _ = trigger.send(HedgeSignal::Trigger);
+                    trigger.fire();
                     await_deadline(
                         &mut request_future,
                         earlier_deadline(total_deadline, send_stage_deadline),
@@ -965,7 +952,7 @@ async fn preflight_attempt_with_trigger(
                 {
                     hedge_triggered = true;
                     if let Some(trigger) = trigger {
-                        let _ = trigger.send(HedgeSignal::Trigger);
+                        trigger.fire();
                     }
                     continue;
                 }

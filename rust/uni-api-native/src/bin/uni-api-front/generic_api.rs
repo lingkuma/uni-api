@@ -19,6 +19,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
 
+use crate::hedging::{
+    await_with_hedge, deadline as hedge_deadline, HedgeEvent, HedgeScheduler, HedgeTrigger,
+    HedgingConfig,
+};
 use crate::persistence::{ChannelStat, RequestStat};
 use crate::provider_stream::{
     self, OutputProtocol as StreamOutputProtocol, Protocol as StreamProtocol,
@@ -270,6 +274,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     let max_attempts = compute_retry_count(&resolved.providers)
         .max(resolved.providers.len())
         .min(10);
+    let hedging = resolved.hedging;
     let auto_retry = state
         .native_responses_config
         .auto_retry_enabled(&headers)
@@ -319,6 +324,9 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
     if use_precommit_stream {
         return precommit_chat_stream(execution);
     }
+    if chat_nonstream_hedging_enabled(&execution.path, execution.input.payload.as_ref(), hedging) {
+        return run_hedged_attempt_loop(execution, hedging).await;
+    }
     run_attempt_loop(execution).await
 }
 
@@ -344,6 +352,19 @@ struct AttemptLoop {
     prompt_price: f64,
     completion_price: f64,
     precommit_comment_sent: bool,
+}
+
+fn chat_nonstream_hedging_enabled(
+    path: &str,
+    payload: Option<&Value>,
+    hedging: HedgingConfig,
+) -> bool {
+    path == "/v1/chat/completions"
+        && payload
+            .and_then(|payload| payload.get("stream"))
+            .and_then(Value::as_bool)
+            .is_none_or(|stream| !stream)
+        && hedging.active()
 }
 
 fn provider_uses_responses_chat(provider: &Provider) -> bool {
@@ -411,6 +432,491 @@ fn precommit_chat_stream(execution: AttemptLoop) -> Response<Body> {
         .headers_mut()
         .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
     response
+}
+
+#[derive(Clone)]
+struct GenericHedgeContext {
+    attempt_index: usize,
+    attempt_started: Instant,
+    provider: Arc<Provider>,
+    original_model: String,
+    provider_key: String,
+    upstream_url: String,
+}
+
+struct GenericHedgePlan {
+    context: GenericHedgeContext,
+    prepared: PreparedAttempt,
+}
+
+struct GenericHedgeSuccess {
+    context: GenericHedgeContext,
+    success: AttemptSuccess,
+}
+
+struct GenericHedgeFailure {
+    context: GenericHedgeContext,
+    failure: AttemptFailure,
+}
+
+async fn next_generic_hedge_plan(
+    execution: &AttemptLoop,
+    cursor: &mut usize,
+    last_status: &mut StatusCode,
+    last_detail: &mut String,
+) -> Option<GenericHedgePlan> {
+    while *cursor < execution.max_attempts {
+        let attempt_index = *cursor;
+        *cursor += 1;
+        let provider = execution.providers[attempt_index % execution.providers.len()].clone();
+        let Some(original_model) = provider.models.get(&execution.request_model).cloned() else {
+            continue;
+        };
+        let key_selection = if let Some(route) = execution
+            .video_task_route
+            .as_ref()
+            .filter(|route| route.provider_name == provider.name.as_ref())
+        {
+            ProviderKeySelection::Selected(route.provider_key.clone())
+        } else {
+            execution
+                .state
+                .native_responses_config
+                .select_provider_key(&provider, &original_model)
+                .await
+        };
+        let provider_key_raw = match key_selection {
+            ProviderKeySelection::Selected(key) => key,
+            ProviderKeySelection::NoProviderKey => {
+                *last_status = StatusCode::BAD_GATEWAY;
+                *last_detail = format!("Provider {} has no API key", provider.name);
+                emit_routing_skip(
+                    execution,
+                    attempt_index,
+                    &provider,
+                    &original_model,
+                    "provider_has_no_api_keys",
+                );
+                continue;
+            }
+            ProviderKeySelection::ChannelCooling => {
+                *last_status = StatusCode::TOO_MANY_REQUESTS;
+                *last_detail = "All matching provider routes are cooling down".into();
+                emit_routing_skip(
+                    execution,
+                    attempt_index,
+                    &provider,
+                    &original_model,
+                    "provider_channel_cooldown",
+                );
+                continue;
+            }
+            ProviderKeySelection::AllKeysCooling => {
+                *last_status = StatusCode::TOO_MANY_REQUESTS;
+                *last_detail = "All matching provider routes are cooling down".into();
+                emit_routing_skip(
+                    execution,
+                    attempt_index,
+                    &provider,
+                    &original_model,
+                    "provider_keys_cooldown",
+                );
+                continue;
+            }
+        };
+        let mut provider_key = provider_key_raw.clone();
+        let mut codex_account_id = None;
+        if provider.engine.eq_ignore_ascii_case("codex") && provider_key_raw.contains(',') {
+            match execution
+                .state
+                .codex_oauth
+                .resolve(
+                    &provider_key_raw,
+                    provider.preferences.get("proxy").and_then(Value::as_str),
+                )
+                .await
+            {
+                Ok(auth) => {
+                    provider_key = auth.bearer;
+                    codex_account_id = auth.account_id;
+                }
+                Err(error) => {
+                    *last_status = StatusCode::UNAUTHORIZED;
+                    *last_detail = error;
+                    emit_routing_skip(
+                        execution,
+                        attempt_index,
+                        &provider,
+                        &original_model,
+                        "codex_oauth_resolution_failed",
+                    );
+                    continue;
+                }
+            }
+        }
+        let mut prepared = match build_attempt(
+            &provider,
+            &provider_key,
+            &execution.request_model,
+            &original_model,
+            &execution.method,
+            &execution.uri,
+            &execution.path,
+            &execution.headers,
+            &execution.input,
+            &execution.request_id,
+        ) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                *last_status = StatusCode::BAD_REQUEST;
+                *last_detail = error;
+                emit_routing_skip(
+                    execution,
+                    attempt_index,
+                    &provider,
+                    &original_model,
+                    "attempt_build_failed",
+                );
+                continue;
+            }
+        };
+        if let Some(account_id) = codex_account_id {
+            if let Ok(value) = HeaderValue::from_str(&account_id) {
+                prepared.headers.insert("chatgpt-account-id", value);
+            }
+        }
+        let attempt_id = format!("{}-r{}", execution.request_id, attempt_index + 1);
+        if let Ok(value) = HeaderValue::from_str(&attempt_id) {
+            prepared
+                .headers
+                .insert("x-uni-api-attempt-id", value.clone());
+            if provider
+                .preferences
+                .get("oaix_routing_attempt_id")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                prepared.headers.insert("x-oaix-routing-attempt-id", value);
+            }
+        }
+        let attempt_started = Instant::now();
+        emit_attempt(
+            &execution.request_id,
+            &execution.trace_id,
+            &execution.api_key_role,
+            attempt_index,
+            &provider,
+            &execution.request_model,
+            &original_model,
+            &prepared.url,
+            "started",
+            None,
+        );
+        let upstream_url = prepared.url.clone();
+        return Some(GenericHedgePlan {
+            context: GenericHedgeContext {
+                attempt_index,
+                attempt_started,
+                provider,
+                original_model,
+                provider_key: provider_key_raw,
+                upstream_url,
+            },
+            prepared,
+        });
+    }
+    None
+}
+
+fn emit_routing_skip(
+    execution: &AttemptLoop,
+    attempt_index: usize,
+    provider: &Provider,
+    original_model: &str,
+    skip_reason: &str,
+) {
+    eprintln!(
+        "{}",
+        json!({
+            "kind": "log",
+            "fugue_table": "app_events",
+            "event": "routing_attempt",
+            "event_type": "routing_attempt",
+            "severity": "info",
+            "source": "uni-api-ember",
+            "message": "uni-api-ember generic routing attempt",
+            "request_id": execution.request_id,
+            "trace_id": execution.trace_id,
+            "path": execution.path,
+            "path_template": execution.path,
+            "route": format!("{} {}", execution.method, execution.path),
+            "method": execution.method.as_str(),
+            "model": execution.request_model,
+            "provider": provider.name.as_ref(),
+            "channel": provider.name.as_ref(),
+            "role": execution.api_key_role,
+            "actual_model": original_model,
+            "attempt_id": format!("{}-r{}", execution.request_id, attempt_index + 1),
+            "attempt_index": attempt_index + 1,
+            "attempt_outcome": "skipped",
+            "skip_reason": skip_reason,
+            "streaming": false,
+            "rust_generic_data_plane": true,
+        })
+    );
+}
+
+fn spawn_generic_hedge_attempt(
+    scheduler: &mut HedgeScheduler<usize, GenericHedgeSuccess, GenericHedgeFailure>,
+    execution: &AttemptLoop,
+    plan: GenericHedgePlan,
+) {
+    let state = execution.state.clone();
+    let incoming_headers = execution.headers.clone();
+    let endpoint = execution.path.clone();
+    let context = plan.context;
+    let key = context.attempt_index;
+    scheduler.spawn(key, move |trigger| async move {
+        match send_attempt(
+            &state,
+            &context.provider,
+            plan.prepared,
+            &incoming_headers,
+            &endpoint,
+            false,
+            Some(&trigger),
+        )
+        .await
+        {
+            Ok(success) => Ok(GenericHedgeSuccess { context, success }),
+            Err(failure) => Err(GenericHedgeFailure { context, failure }),
+        }
+    });
+}
+
+async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig) -> Response<Body> {
+    let mut scheduler = HedgeScheduler::new(hedging.max_inflight_attempts);
+    let mut pending = HashMap::<usize, GenericHedgeContext>::new();
+    let mut cursor = 0usize;
+    let mut trigger_count = 0usize;
+    let mut cancelled_count = 0usize;
+    let mut last_status = StatusCode::BAD_GATEWAY;
+    let mut last_detail = String::from("No upstream attempt succeeded");
+    let mut last_upstream_response = None;
+
+    if let Some(plan) =
+        next_generic_hedge_plan(&execution, &mut cursor, &mut last_status, &mut last_detail).await
+    {
+        pending.insert(plan.context.attempt_index, plan.context.clone());
+        spawn_generic_hedge_attempt(&mut scheduler, &execution, plan);
+    }
+
+    while !scheduler.is_empty() {
+        match scheduler.next_event().await {
+            HedgeEvent::Triggered { key } => {
+                debug_assert!(pending.contains_key(&key));
+                trigger_count = trigger_count.saturating_add(1);
+                if scheduler.has_capacity() {
+                    if let Some(plan) = next_generic_hedge_plan(
+                        &execution,
+                        &mut cursor,
+                        &mut last_status,
+                        &mut last_detail,
+                    )
+                    .await
+                    {
+                        pending.insert(plan.context.attempt_index, plan.context.clone());
+                        spawn_generic_hedge_attempt(&mut scheduler, &execution, plan);
+                    }
+                }
+            }
+            HedgeEvent::Succeeded { key, output } => {
+                pending.remove(&key);
+                let cancelled = scheduler.cancel_remaining();
+                cancelled_count = cancelled_count.saturating_add(cancelled.len());
+                for cancelled_key in cancelled {
+                    if let Some(context) = pending.remove(&cancelled_key) {
+                        emit_attempt(
+                            &execution.request_id,
+                            &execution.trace_id,
+                            &execution.api_key_role,
+                            context.attempt_index,
+                            &context.provider,
+                            &execution.request_model,
+                            &context.original_model,
+                            &context.upstream_url,
+                            "cancelled",
+                            None,
+                        );
+                    }
+                }
+                let GenericHedgeSuccess { context, success } = output;
+                let AttemptSuccess {
+                    response,
+                    status,
+                    usage,
+                    stream_outcome,
+                    upstream_url,
+                } = success;
+                debug_assert!(stream_outcome.is_none());
+                execution.state.persistence.record_channel(ChannelStat {
+                    request_id: execution.request_id.clone(),
+                    provider: context.provider.name.to_string(),
+                    model: execution.request_model.clone(),
+                    api_key: execution.api_key.clone(),
+                    provider_api_key: context.provider_key.clone(),
+                    success: true,
+                });
+                execution
+                    .state
+                    .native_responses_config
+                    .reset_route_failure(&context.provider, &context.original_model)
+                    .await;
+                execution.state.persistence.record_request(RequestStat {
+                    request_id: execution.request_id.clone(),
+                    trace_id: execution.trace_id.clone(),
+                    endpoint: execution.path.clone(),
+                    client_ip: execution.client_ip.clone(),
+                    process_time: execution.started.elapsed().as_secs_f64(),
+                    first_response_time: context.attempt_started.elapsed().as_secs_f64(),
+                    provider: context.provider.name.to_string(),
+                    model: execution.request_model.clone(),
+                    api_key: execution.api_key.clone(),
+                    prompt_tokens: usage.0,
+                    completion_tokens: usage.1,
+                    total_tokens: usage.2,
+                    prompt_price: execution.prompt_price,
+                    completion_price: execution.completion_price,
+                    timing_spans: json!({
+                        "runtime": "rust",
+                        "terminal": "hedge_winner",
+                        "attempt_count": cursor,
+                        "winner_attempt_index": context.attempt_index + 1,
+                        "hedge_trigger_count": trigger_count,
+                        "hedge_cancelled_attempt_count": cancelled_count,
+                        "upstream_ms": context.attempt_started.elapsed().as_millis(),
+                    })
+                    .to_string(),
+                    ..RequestStat::default()
+                });
+                emit_attempt(
+                    &execution.request_id,
+                    &execution.trace_id,
+                    &execution.api_key_role,
+                    context.attempt_index,
+                    &context.provider,
+                    &execution.request_model,
+                    &context.original_model,
+                    &upstream_url,
+                    "completed",
+                    Some(status.as_u16()),
+                );
+                return response;
+            }
+            HedgeEvent::Failed { key, failure } => {
+                pending.remove(&key);
+                let GenericHedgeFailure {
+                    context,
+                    mut failure,
+                } = failure;
+                let policy = classify_provider_failure(
+                    failure.status.as_u16(),
+                    &failure.detail,
+                    Some(&context.provider),
+                    &execution.path,
+                    execution.auto_retry,
+                );
+                failure.status =
+                    StatusCode::from_u16(policy.status).unwrap_or(StatusCode::BAD_GATEWAY);
+                if let Some(response) = failure.response.as_mut() {
+                    *response.status_mut() = failure.status;
+                }
+                last_status = failure.status;
+                last_detail = failure.detail.clone();
+                if let Some(response) = failure.response.take() {
+                    last_upstream_response = Some(response);
+                }
+                execution.state.persistence.record_channel(ChannelStat {
+                    request_id: execution.request_id.clone(),
+                    provider: context.provider.name.to_string(),
+                    model: execution.request_model.clone(),
+                    api_key: execution.api_key.clone(),
+                    provider_api_key: context.provider_key.clone(),
+                    success: false,
+                });
+                if !policy.request_scoped || policy.force_quota_cooldown {
+                    execution
+                        .state
+                        .native_responses_config
+                        .cool_failed_route(FailedRoute {
+                            provider: &context.provider,
+                            key: &context.provider_key,
+                            original_model: &context.original_model,
+                            has_alternative: execution.providers.len() > 1,
+                            status: failure.status.as_u16(),
+                            detail: &failure.detail,
+                            force_quota_cooldown: policy.force_quota_cooldown,
+                        })
+                        .await;
+                }
+                if context.provider.engine.eq_ignore_ascii_case("codex")
+                    && context.provider_key.contains(',')
+                    && matches!(failure.status.as_u16(), 401..=403)
+                {
+                    execution
+                        .state
+                        .codex_oauth
+                        .clear(&context.provider_key)
+                        .await;
+                }
+                emit_attempt(
+                    &execution.request_id,
+                    &execution.trace_id,
+                    &execution.api_key_role,
+                    context.attempt_index,
+                    &context.provider,
+                    &execution.request_model,
+                    &context.original_model,
+                    &failure.upstream_url,
+                    "failed",
+                    Some(failure.status.as_u16()),
+                );
+                if policy.retryable && scheduler.has_capacity() {
+                    if let Some(plan) = next_generic_hedge_plan(
+                        &execution,
+                        &mut cursor,
+                        &mut last_status,
+                        &mut last_detail,
+                    )
+                    .await
+                    {
+                        pending.insert(plan.context.attempt_index, plan.context.clone());
+                        spawn_generic_hedge_attempt(&mut scheduler, &execution, plan);
+                    }
+                }
+            }
+        }
+    }
+
+    execution.state.persistence.record_request(RequestStat {
+        request_id: execution.request_id,
+        trace_id: execution.trace_id,
+        endpoint: execution.path,
+        client_ip: execution.client_ip,
+        process_time: execution.started.elapsed().as_secs_f64(),
+        model: execution.request_model,
+        api_key: execution.api_key,
+        timing_spans: json!({
+            "runtime":"rust",
+            "terminal":"hedge_exhausted",
+            "attempt_count": cursor,
+            "hedge_trigger_count": trigger_count,
+            "hedge_cancelled_attempt_count": cancelled_count,
+        })
+        .to_string(),
+        ..RequestStat::default()
+    });
+    last_upstream_response.unwrap_or_else(|| json_error(last_status, &last_detail))
 }
 
 async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
@@ -536,6 +1042,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             &headers,
             &path,
             precommit_comment_sent,
+            None,
         )
         .await
         {
@@ -983,6 +1490,7 @@ pub(crate) async fn run_moderation_preflight(
             headers,
             "/v1/moderations",
             false,
+            None,
         )
         .await
         {
@@ -2125,6 +2633,7 @@ async fn send_attempt(
     incoming_headers: &HeaderMap,
     endpoint: &str,
     precommit_comment_sent: bool,
+    hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
     let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
     let http1_only = provider.engine.eq_ignore_ascii_case("codex");
@@ -2152,7 +2661,12 @@ async fn send_attempt(
             response: None,
         })?;
     let base_timeout = provider_timeout(provider, &prepared.original_model);
-    let total_timeout = positive_duration(timeouts.total).unwrap_or(base_timeout);
+    let configured_total_timeout = positive_duration(timeouts.total);
+    let request_timeout = if hedge_trigger.is_some() {
+        configured_total_timeout
+    } else {
+        Some(configured_total_timeout.unwrap_or(base_timeout))
+    };
     let send_timeout = [
         timeouts.first_byte,
         timeouts.write,
@@ -2191,8 +2705,10 @@ async fn send_attempt(
     }
     let mut request = client
         .request(prepared.method.clone(), &prepared.url)
-        .headers(prepared.headers.clone())
-        .timeout(total_timeout);
+        .headers(prepared.headers.clone());
+    if let Some(timeout) = request_timeout {
+        request = request.timeout(timeout);
+    }
     request = match prepared.body {
         AttemptBody::Json(body) => request.body(body),
         AttemptBody::Replay(storage, observation) => {
@@ -2246,15 +2762,29 @@ async fn send_attempt(
                 upstream_url: prepared.url.clone(),
                 response: None,
             })?;
-            client
+            let mut request = client
                 .request(prepared.method.clone(), &prepared.url)
-                .headers(headers)
-                .timeout(total_timeout)
-                .body(body)
+                .headers(headers);
+            if let Some(timeout) = request_timeout {
+                request = request.timeout(timeout);
+            }
+            request.body(body)
         }
         AttemptBody::Empty => request,
     };
-    let response = tokio::time::timeout(send_timeout, request.send())
+    let response = if let Some(trigger) = hedge_trigger {
+        let started = tokio::time::Instant::now();
+        let hard_timeout = [timeouts.write, timeouts.pool, timeouts.total]
+            .into_iter()
+            .flatten()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .min_by(f64::total_cmp);
+        await_with_hedge(
+            request.send(),
+            Some(started + positive_duration(timeouts.first_byte).unwrap_or(base_timeout)),
+            hedge_deadline(started, hard_timeout),
+            Some(trigger),
+        )
         .await
         .map_err(|_| AttemptFailure {
             status: StatusCode::GATEWAY_TIMEOUT,
@@ -2262,12 +2792,23 @@ async fn send_attempt(
             upstream_url: prepared.url.clone(),
             response: None,
         })?
-        .map_err(|error| AttemptFailure {
-            status: StatusCode::BAD_GATEWAY,
-            detail: format!("Upstream transport error: {error}"),
-            upstream_url: prepared.url.clone(),
-            response: None,
-        })?;
+        .output
+    } else {
+        tokio::time::timeout(send_timeout, request.send())
+            .await
+            .map_err(|_| AttemptFailure {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                detail: "Upstream response headers timed out".into(),
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?
+    }
+    .map_err(|error| AttemptFailure {
+        status: StatusCode::BAD_GATEWAY,
+        detail: format!("Upstream transport error: {error}"),
+        upstream_url: prepared.url.clone(),
+        response: None,
+    })?;
     let status = response.status();
     if !status.is_success() {
         let headers = filtered_response_headers(response.headers());
@@ -5340,17 +5881,30 @@ fn emit_attempt(
     eprintln!(
         "{}",
         json!({
-            "event_type":"rust_native_api_attempt",
-            "request_id":request_id,
-            "trace_id":trace_id,
-            "role":role,
-            "attempt_index":attempt_index + 1,
-            "provider":provider.name.as_ref(),
-            "request_model":request_model,
-            "actual_model":original_model,
-            "upstream_host":upstream_host,
-            "outcome":outcome,
-            "status_code":status,
+            "kind": "log",
+            "fugue_table": "app_events",
+            "event": "upstream_attempt",
+            "event_type": "upstream_attempt",
+            "severity": if status.is_some_and(|status| status >= 400) { "warn" } else { "info" },
+            "source": "uni-api-ember",
+            "message": "uni-api-ember generic upstream attempt",
+            "request_id": request_id,
+            "trace_id": trace_id,
+            "role": role,
+            "attempt_id": format!("{request_id}-r{}", attempt_index + 1),
+            "attempt_index": attempt_index + 1,
+            "provider": provider.name.as_ref(),
+            "channel": provider.name.as_ref(),
+            "model": request_model,
+            "request_model": request_model,
+            "actual_model": original_model,
+            "upstream_host": upstream_host,
+            "attempt_outcome": outcome,
+            "attempt_status_code": status,
+            "attempt_success": outcome == "completed",
+            "outcome": outcome,
+            "status_code": status,
+            "rust_generic_data_plane": true,
         })
     );
 }
@@ -5375,6 +5929,40 @@ fn unix_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hedging_applies_only_to_nonstream_chat_completions() {
+        let enabled = HedgingConfig {
+            enabled: true,
+            max_inflight_attempts: 2,
+            winner_policy: crate::hedging::WinnerPolicy::FirstValidSuccess,
+        };
+        assert!(chat_nonstream_hedging_enabled(
+            "/v1/chat/completions",
+            Some(&json!({"stream": false})),
+            enabled,
+        ));
+        assert!(chat_nonstream_hedging_enabled(
+            "/v1/chat/completions",
+            Some(&json!({})),
+            enabled,
+        ));
+        assert!(!chat_nonstream_hedging_enabled(
+            "/v1/chat/completions",
+            Some(&json!({"stream": true})),
+            enabled,
+        ));
+        assert!(!chat_nonstream_hedging_enabled(
+            "/v1/responses",
+            Some(&json!({"stream": false})),
+            enabled,
+        ));
+        assert!(!chat_nonstream_hedging_enabled(
+            "/v1/chat/completions",
+            Some(&json!({"stream": false})),
+            HedgingConfig::default(),
+        ));
+    }
 
     fn test_provider(engine: &str, base_url: &str) -> Provider {
         Provider {

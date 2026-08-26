@@ -17,6 +17,7 @@ use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 use crate::codex_oauth::CodexOAuthManager;
+use crate::hedging::{parse_hedging, HedgingConfig};
 use crate::persistence::{ChannelStat, Persistence, RequestStat};
 use crate::request_spool::{SpoolObservation, StoredBody};
 use crate::resources::MemoryReservation;
@@ -202,6 +203,7 @@ pub(crate) enum ProviderKeySelection {
 
 pub(crate) struct ResolvedRoute {
     pub(crate) providers: Vec<Arc<Provider>>,
+    pub(crate) hedging: HedgingConfig,
 }
 
 pub(crate) struct RouteResolutionError {
@@ -280,59 +282,6 @@ pub struct NativeRoute {
     started_at: tokio::time::Instant,
     final_emitted: bool,
     _memory_reservation: MemoryReservation,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HedgingConfig {
-    pub(crate) enabled: bool,
-    pub(crate) max_inflight_attempts: usize,
-    pub(crate) winner_policy: WinnerPolicy,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WinnerPolicy {
-    FirstValidSuccess,
-}
-
-impl Default for HedgingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_inflight_attempts: 1,
-            winner_policy: WinnerPolicy::FirstValidSuccess,
-        }
-    }
-}
-
-fn parse_hedging(preferences: &Map<String, Value>) -> HedgingConfig {
-    let Some(value) = preferences.get("hedging").and_then(Value::as_object) else {
-        return HedgingConfig::default();
-    };
-    let max_inflight_attempts = value
-        .get("max_inflight_attempts")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(1)
-        .clamp(1, 4);
-    let winner_policy = match value
-        .get("winner_policy")
-        .and_then(Value::as_str)
-        .unwrap_or("first_valid_success")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "first_valid_success" => WinnerPolicy::FirstValidSuccess,
-        _ => return HedgingConfig::default(),
-    };
-    HedgingConfig {
-        enabled: value
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        max_inflight_attempts,
-        winner_policy,
-    }
 }
 
 impl NativeConfigStore {
@@ -824,7 +773,8 @@ impl NativeConfigStore {
         let providers = self
             .schedule_providers(&api_key, request_model, providers)
             .await;
-        Ok(ResolvedRoute { providers })
+        let hedging = parse_hedging(&snapshot.preferences);
+        Ok(ResolvedRoute { providers, hedging })
     }
 
     pub(crate) async fn ensure_paid_balance(
@@ -1069,9 +1019,7 @@ impl NativeRoute {
     }
 
     pub(crate) fn hedging_enabled(&self) -> bool {
-        self.hedging.enabled
-            && self.hedging.max_inflight_attempts > 1
-            && self.hedging.winner_policy == WinnerPolicy::FirstValidSuccess
+        self.hedging.active()
     }
 
     pub(crate) fn hedge_slots(&self) -> usize {
@@ -3715,7 +3663,10 @@ mod tests {
         )]));
         assert!(config.enabled);
         assert_eq!(config.max_inflight_attempts, 2);
-        assert_eq!(config.winner_policy, WinnerPolicy::FirstValidSuccess);
+        assert_eq!(
+            config.winner_policy,
+            crate::hedging::WinnerPolicy::FirstValidSuccess
+        );
 
         let invalid = parse_hedging(&Map::from_iter([(
             "hedging".into(),
