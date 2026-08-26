@@ -608,6 +608,8 @@ async fn next_generic_hedge_plan(
             &provider,
             &execution.request_model,
             &original_model,
+            &execution.path,
+            &execution.method,
             &prepared.url,
             "started",
             None,
@@ -744,6 +746,8 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                             &context.provider,
                             &execution.request_model,
                             &context.original_model,
+                            &execution.path,
+                            &execution.method,
                             &context.upstream_url,
                             "cancelled",
                             None,
@@ -807,6 +811,8 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     &context.provider,
                     &execution.request_model,
                     &context.original_model,
+                    &execution.path,
+                    &execution.method,
                     &upstream_url,
                     "completed",
                     Some(status.as_u16()),
@@ -877,6 +883,8 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     &context.provider,
                     &execution.request_model,
                     &context.original_model,
+                    &execution.path,
+                    &execution.method,
                     &failure.upstream_url,
                     "failed",
                     Some(failure.status.as_u16()),
@@ -1031,6 +1039,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             &provider,
             &request_model,
             &original_model,
+            &path,
+            &method,
             &prepared.url,
             "started",
             None,
@@ -1088,6 +1098,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     let outcome_model = request_model.clone();
                     let outcome_api_key = api_key.clone();
                     let outcome_path = path.clone();
+                    let outcome_method = method.clone();
                     let has_alternative = providers.len() > 1;
                     tokio::spawn(async move {
                         let outcome = stream_outcome.await.unwrap_or_else(|_| {
@@ -1164,6 +1175,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             &outcome_provider,
                             &outcome_model,
                             &outcome_original_model,
+                            &outcome_path,
+                            &outcome_method,
                             &upstream_url,
                             if outcome.success {
                                 "completed"
@@ -1196,6 +1209,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     &provider,
                     &request_model,
                     &original_model,
+                    &path,
+                    &method,
                     &upstream_url,
                     "completed",
                     Some(status.as_u16()),
@@ -1256,6 +1271,8 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     &provider,
                     &request_model,
                     &original_model,
+                    &path,
+                    &method,
                     &failure.upstream_url,
                     "failed",
                     Some(failure.status.as_u16()),
@@ -5870,6 +5887,8 @@ fn emit_attempt(
     provider: &Provider,
     request_model: &str,
     original_model: &str,
+    endpoint: &str,
+    method: &Method,
     url: &str,
     outcome: &str,
     status: Option<u16>,
@@ -5878,18 +5897,32 @@ fn emit_attempt(
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
         .unwrap_or_default();
+    let event = if outcome == "started" {
+        "routing_attempt"
+    } else {
+        "upstream_attempt"
+    };
+    let attempt_success = match outcome {
+        "completed" => Some(true),
+        "failed" | "cancelled" => Some(false),
+        _ => None,
+    };
     eprintln!(
         "{}",
         json!({
             "kind": "log",
             "fugue_table": "app_events",
-            "event": "upstream_attempt",
-            "event_type": "upstream_attempt",
+            "event": event,
+            "event_type": event,
             "severity": if status.is_some_and(|status| status >= 400) { "warn" } else { "info" },
             "source": "uni-api-ember",
-            "message": "uni-api-ember generic upstream attempt",
+            "message": format!("uni-api-ember generic {event}"),
             "request_id": request_id,
             "trace_id": trace_id,
+            "path": endpoint,
+            "path_template": endpoint,
+            "route": format!("{} {endpoint}", method.as_str()),
+            "method": method.as_str(),
             "role": role,
             "attempt_id": format!("{request_id}-r{}", attempt_index + 1),
             "attempt_index": attempt_index + 1,
@@ -5901,7 +5934,7 @@ fn emit_attempt(
             "upstream_host": upstream_host,
             "attempt_outcome": outcome,
             "attempt_status_code": status,
-            "attempt_success": outcome == "completed",
+            "attempt_success": attempt_success,
             "outcome": outcome,
             "status_code": status,
             "rust_generic_data_plane": true,
