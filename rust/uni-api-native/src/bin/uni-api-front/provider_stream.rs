@@ -127,6 +127,7 @@ pub async fn translate_responses_to_chat(
     };
     let idle = positive_duration(idle_timeout_seconds);
     let mut buffer = Vec::new();
+    let mut retained = Vec::new();
 
     loop {
         while let Some((end, separator)) = next_event_boundary(&buffer) {
@@ -134,8 +135,19 @@ pub async fn translate_responses_to_chat(
             buffer.drain(..separator);
             match classify_responses_precommit_event(&event)? {
                 PrecommitDecision::Ignore => {}
+                PrecommitDecision::Retain => {
+                    retained.extend_from_slice(&event);
+                    retained.extend_from_slice(b"\n\n");
+                    if retained.len() > MAX_STREAM_FRAME_BYTES {
+                        return Err(PrecommitFailure {
+                            status_code: 502,
+                            detail: "upstream Responses precommit output exceeded 1 MiB".into(),
+                        });
+                    }
+                }
                 PrecommitDecision::Commit => {
-                    let mut primed = event;
+                    let mut primed = retained;
+                    primed.extend_from_slice(&event);
                     primed.extend_from_slice(b"\n\n");
                     primed.extend_from_slice(&buffer);
                     let upstream = stream::iter([Ok(Bytes::from(primed))])
@@ -180,7 +192,8 @@ pub async fn translate_responses_to_chat(
                 if !buffer.iter().all(u8::is_ascii_whitespace) {
                     match classify_responses_precommit_event(&buffer)? {
                         PrecommitDecision::Commit => {
-                            let upstream = stream::iter([Ok(Bytes::from(buffer))]).boxed();
+                            retained.extend_from_slice(&buffer);
+                            let upstream = stream::iter([Ok(Bytes::from(retained))]).boxed();
                             return Ok(spawn_translation(
                                 status,
                                 content_type,
@@ -194,7 +207,7 @@ pub async fn translate_responses_to_chat(
                                 emit_precommit_comment,
                             ));
                         }
-                        PrecommitDecision::Ignore => {}
+                        PrecommitDecision::Ignore | PrecommitDecision::Retain => {}
                     }
                 }
                 return Err(PrecommitFailure {
@@ -449,6 +462,7 @@ fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrecommitDecision {
     Ignore,
+    Retain,
     Commit,
 }
 
@@ -550,8 +564,7 @@ fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision,
             status_code: 502,
             detail: "upstream Responses request ended incomplete before commit".into(),
         }),
-        _ if responses_event_has_real_output(event_type, &payload) => Ok(PrecommitDecision::Commit),
-        _ => Ok(PrecommitDecision::Ignore),
+        _ => Ok(responses_event_precommit_decision(event_type, &payload)),
     }
 }
 
@@ -583,6 +596,18 @@ fn validate_responses_terminal(event_type: &str, payload: &Value) -> Result<(), 
 }
 
 fn responses_event_has_real_output(event_type: &str, payload: &Value) -> bool {
+    responses_event_has_output(event_type, payload, |value| !value.trim().is_empty())
+}
+
+fn responses_event_has_nonempty_output(event_type: &str, payload: &Value) -> bool {
+    responses_event_has_output(event_type, payload, |value| !value.is_empty())
+}
+
+fn responses_event_has_output(
+    event_type: &str,
+    payload: &Value,
+    has_text: fn(&str) -> bool,
+) -> bool {
     match event_type {
         "response.output_text.delta"
         | "response.reasoning_summary_text.delta"
@@ -590,7 +615,7 @@ fn responses_event_has_real_output(event_type: &str, payload: &Value) -> bool {
         | "response.function_call_arguments.delta" => payload
             .get("delta")
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty()),
+            .is_some_and(has_text),
         "response.output_item.added" => payload
             .get("item")
             .filter(|item| {
@@ -603,44 +628,50 @@ fn responses_event_has_real_output(event_type: &str, payload: &Value) -> bool {
                 ["name", "arguments", "call_id"].iter().any(|field| {
                     item.get(*field)
                         .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty())
+                        .is_some_and(has_text)
                 })
             }),
-        "response.output_item.done" => payload.get("item").is_some_and(item_has_real_output),
-        "response.content_part.added" | "response.content_part.done" => {
-            payload.get("part").is_some_and(|part| {
-                ["text", "refusal"].iter().any(|field| {
-                    part.get(*field)
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty())
-                })
-            })
-        }
+        "response.output_item.done" => payload
+            .get("item")
+            .is_some_and(|item| item_has_output(item, has_text)),
+        "response.content_part.added" | "response.content_part.done" => payload
+            .get("part")
+            .is_some_and(|part| part_has_output(part, has_text)),
         event_type if event_type.starts_with("response.") && event_type.ends_with(".done") => {
             ["text", "refusal", "arguments"].iter().any(|field| {
                 payload
                     .get(*field)
                     .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
+                    .is_some_and(has_text)
             })
         }
         _ => false,
     }
 }
 
-fn item_has_real_output(item: &Value) -> bool {
+fn responses_event_precommit_decision(event_type: &str, payload: &Value) -> PrecommitDecision {
+    if responses_event_has_real_output(event_type, payload) {
+        PrecommitDecision::Commit
+    } else if responses_event_has_nonempty_output(event_type, payload) {
+        PrecommitDecision::Retain
+    } else {
+        PrecommitDecision::Ignore
+    }
+}
+
+fn part_has_output(part: &Value, has_text: fn(&str) -> bool) -> bool {
+    ["text", "refusal"].iter().any(|field| {
+        part.get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(has_text)
+    })
+}
+
+fn item_has_output(item: &Value, has_text: fn(&str) -> bool) -> bool {
     if item
         .get("content")
         .and_then(Value::as_array)
-        .is_some_and(|parts| {
-            parts.iter().any(|part| {
-                ["text", "refusal"].iter().any(|field| {
-                    part.get(*field)
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty())
-                })
-            })
-        })
+        .is_some_and(|parts| parts.iter().any(|part| part_has_output(part, has_text)))
     {
         return true;
     }
@@ -650,7 +681,7 @@ fn item_has_real_output(item: &Value) -> bool {
     ) && ["name", "arguments", "call_id"].iter().any(|field| {
         item.get(*field)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty())
+            .is_some_and(has_text)
     })
 }
 
@@ -1964,6 +1995,13 @@ mod tests {
         );
         assert_eq!(
             classify_responses_precommit_event(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" \\n\\t\"}"
+            )
+            .unwrap(),
+            PrecommitDecision::Retain
+        );
+        assert_eq!(
+            classify_responses_precommit_event(
                 b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"in_progress\"}}"
             )
             .unwrap_err()
@@ -2012,9 +2050,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_precommit_retains_whitespace_prefix_for_successful_output() {
+        let response = mock_sse_response(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n\
+             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" \"}\n\n\
+             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n\
+             event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        )
+        .await;
+        let translation = translate_responses_to_chat(
+            response,
+            OutputProtocol::Chat,
+            "public-model".into(),
+            false,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(translation.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let wire = String::from_utf8(body.to_vec()).unwrap();
+
+        let whitespace = wire.find("\"content\":\" \"").unwrap();
+        let text = wire.find("\"content\":\"hello\"").unwrap();
+        assert!(whitespace < text);
+    }
+
+    #[tokio::test]
     async fn responses_precommit_returns_semantic_failure_before_response_commit() {
         let response = mock_sse_response(
             "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n\
+             event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"content\":[]}}\n\n\
+             event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n\
+             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" \"}\n\n\
              event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"Concurrency limit exceeded for account, please retry later\"}}}\n\n",
         )
         .await;
