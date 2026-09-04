@@ -92,10 +92,16 @@ def test_list_models_returns_codex_catalog_for_client_version():
     )
     assert "etag" not in response.headers
     assert [model["slug"] for model in body["models"]] == [
+        "gpt-6-astra",
+        "gpt-reserve",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
         "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+        "codex-auto-review",
     ]
 
 

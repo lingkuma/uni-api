@@ -70,7 +70,7 @@ def test_list_models_payload_uses_cache_before_fallback():
     assert len(calls) == 1
 
 
-def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
+def test_codex_models_payload_returns_complete_verified_pro_snapshot():
     payload = codex_models_payload(
         api_index=0,
         api_list=["sk-test"],
@@ -103,12 +103,10 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
         "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.4",
-        "gpt-5.6-sol-max",
-        "gpt-5.5-fast",
-        "gpt-default",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+        "codex-auto-review",
     ]
-    assert "gpt-5.3-codex-spark" not in models
-    assert "codex-auto-review" not in models
     assert "gpt-image-2" not in models
 
     astra = models["gpt-6-astra"]
@@ -143,14 +141,6 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
     assert luna["multi_agent_version"] == "v1"
     assert models["gpt-5.4"]["max_context_window"] == 1000000
     assert models["gpt-5.5"]["max_context_window"] == 272000
-    assert models["gpt-5.6-sol-max"]["context_window"] == 272000
-    assert [
-        level["effort"]
-        for level in models["gpt-5.6-sol-max"]["supported_reasoning_levels"]
-    ][-2:] == ["max", "ultra"]
-    assert models["gpt-5.5-fast"]["comp_hash"] == "2911"
-    assert models["gpt-default"]["description"] == "Available through uni-api."
-    assert models["gpt-default"]["priority"] >= 100
 
 
 def test_codex_pro_models_snapshot_matches_verified_official_response():

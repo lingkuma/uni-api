@@ -195,32 +195,7 @@ def codex_models_payload(
     models_list: dict[str, list[str]],
     build_models: Callable[[int, dict, list[str], dict[str, list[str]]], list[dict]],
 ) -> dict[str, Any]:
-    available = list_models_payload(
-        api_index=api_index,
-        api_list=api_list,
-        model_response_cache=model_response_cache,
-        config=config,
-        models_list=models_list,
-        build_models=build_models,
-    )
-    available_model_ids = [
-        str(model.get("id", "")).strip()
-        for model in available["data"]
-        if isinstance(model, dict) and str(model.get("id", "")).strip()
-    ]
-    allowed_model_ids = set(available_model_ids)
-    models = [
-        model
-        for model in _CODEX_PRO_MODELS_SNAPSHOT["models"]
-        if model.get("slug") in allowed_model_ids
-    ]
-    included_model_ids = {str(model.get("slug", "")).strip() for model in models}
-    for model_id in available_model_ids:
-        if model_id in included_model_ids or not _is_codex_catalog_model_id(model_id):
-            continue
-        models.append(_codex_compatible_model(model_id, 100 + len(models)))
-        included_model_ids.add(model_id)
-    return {"models": models}
+    return copy.deepcopy(_CODEX_PRO_MODELS_SNAPSHOT)
 
 
 def _is_codex_catalog_model_id(model_id: str) -> bool:
