@@ -9,11 +9,11 @@ from core.utils import get_model_dict
 
 
 MODEL_INFO_CREATED = 1720524448858
-CODEX_PRO_MODELS_SNAPSHOT_CLIENT_VERSION = "0.144.0"
-CODEX_PRO_MODELS_SNAPSHOT_UPSTREAM_ETAG = 'W/"eaaa93847c22739b392a6260ccd9af1c"'
+CODEX_PRO_MODELS_SNAPSHOT_CLIENT_VERSION = "0.153.2"
+CODEX_PRO_MODELS_SNAPSHOT_UPSTREAM_ETAG = 'W/"568f1e5faa711c9a79e1426428e2ea34"'
 
 _CODEX_PRO_MODELS_SNAPSHOT = json.loads(
-    Path(__file__).with_name("codex_models_pro_0_144_0.json").read_text(encoding="utf-8")
+    Path(__file__).with_name("codex_models_pro_0_153_2.json").read_text(encoding="utf-8")
 )
 _CODEX_PRO_MODELS_BY_SLUG = {
     str(model["slug"]).strip(): model
@@ -247,6 +247,7 @@ def _codex_fallback_model(model_id: str, priority: int) -> dict[str, Any]:
     supports_reasoning = (
         "codex" in lower
         or lower.startswith("gpt-5")
+        or lower.startswith("gpt-6")
         or lower.startswith("o1")
         or lower.startswith("o3")
         or lower.startswith("o4")

@@ -191,7 +191,7 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
     };
     if query_value(uri, "client_version").is_some() {
         let catalog: Value = serde_json::from_str(include_str!(
-            "../../../../../uni_api/api/codex_models_pro_0_144_0.json"
+            "../../../../../uni_api/api/codex_models_pro_0_153_2.json"
         ))
         .unwrap_or_else(|_| json!({"models":[]}));
         let allowed = models.iter().map(String::as_str).collect::<HashSet<_>>();
@@ -238,6 +238,14 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
         response.headers_mut().insert(
             "x-uni-api-models-source",
             HeaderValue::from_static("codex-pro-snapshot"),
+        );
+        response.headers_mut().insert(
+            "x-uni-api-models-snapshot-client-version",
+            HeaderValue::from_static("0.153.2"),
+        );
+        response.headers_mut().insert(
+            "x-uni-api-models-upstream-etag",
+            HeaderValue::from_static("W/\"568f1e5faa711c9a79e1426428e2ea34\""),
         );
         return response;
     }
@@ -291,7 +299,7 @@ fn codex_compatible_model(model: &str, priority: usize, catalog: &HashMap<String
         return template;
     }
     let supports_reasoning = lower.contains("codex")
-        || ["gpt-5", "o1", "o3", "o4"]
+        || ["gpt-5", "gpt-6", "o1", "o3", "o4"]
             .into_iter()
             .any(|prefix| lower.starts_with(prefix));
     let supports_images = !lower.contains("deepseek");
@@ -634,6 +642,8 @@ mod tests {
         assert_eq!(fallback["slug"], "gpt-5-custom");
         assert_eq!(fallback["default_reasoning_level"], "medium");
         assert_eq!(fallback["input_modalities"], json!(["text", "image"]));
+        let gpt6 = codex_compatible_model("gpt-6-custom", 102, &HashMap::new());
+        assert_eq!(gpt6["default_reasoning_level"], "medium");
         assert!(is_codex_catalog_model("deepseek-chat"));
         assert!(!is_codex_catalog_model("text-embedding-3-large"));
     }

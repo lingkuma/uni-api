@@ -78,6 +78,8 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
             "sk-test": [
                 {"id": "gpt-5.4"},
                 {"id": "gpt-5.5"},
+                {"id": "gpt-6-astra"},
+                {"id": "gpt-reserve"},
                 {"id": "gpt-5.6-sol"},
                 {"id": "gpt-5.6-terra"},
                 {"id": "gpt-5.6-luna"},
@@ -94,6 +96,8 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
 
     models = {model["slug"]: model for model in payload["models"]}
     assert list(models) == [
+        "gpt-6-astra",
+        "gpt-reserve",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -107,6 +111,15 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
     assert "codex-auto-review" not in models
     assert "gpt-image-2" not in models
 
+    astra = models["gpt-6-astra"]
+    assert astra["minimal_client_version"] == "0.153.0"
+    assert astra["context_window"] == 272000
+    assert astra["max_context_window"] == 872000
+    assert [level["effort"] for level in astra["supported_reasoning_levels"]][-2:] == [
+        "max",
+        "ultra",
+    ]
+
     sol = models["gpt-5.6-sol"]
     assert sol["default_reasoning_level"] == "low"
     assert [level["effort"] for level in sol["supported_reasoning_levels"]] == [
@@ -117,8 +130,8 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
         "max",
         "ultra",
     ]
-    assert sol["context_window"] == 372000
-    assert sol["max_context_window"] == 372000
+    assert sol["context_window"] == 272000
+    assert sol["max_context_window"] == 872000
     assert sol["use_responses_lite"] is True
     assert sol["tool_mode"] == "code_mode_only"
     assert sol["multi_agent_version"] == "v2"
@@ -130,7 +143,7 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
     assert luna["multi_agent_version"] == "v1"
     assert models["gpt-5.4"]["max_context_window"] == 1000000
     assert models["gpt-5.5"]["max_context_window"] == 272000
-    assert models["gpt-5.6-sol-max"]["context_window"] == 372000
+    assert models["gpt-5.6-sol-max"]["context_window"] == 272000
     assert [
         level["effort"]
         for level in models["gpt-5.6-sol-max"]["supported_reasoning_levels"]
@@ -145,10 +158,10 @@ def test_codex_pro_models_snapshot_matches_verified_official_response():
         Path(__file__).parents[1]
         / "uni_api"
         / "api"
-        / "codex_models_pro_0_144_0.json"
+        / "codex_models_pro_0_153_2.json"
     )
     assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == (
-        "c21a449d1a9785661087e9a6d2aaa217c4b77813a69f1190fa02728b5bd68345"
+        "bbc720b09ec2237d48bf4ebb14dc9f239b1d47437771ed302bc6eb008fa37e73"
     )
 
 
