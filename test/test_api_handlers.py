@@ -151,8 +151,24 @@ def test_codex_pro_models_snapshot_matches_verified_official_response():
         / "codex_models_pro_0_153_2.json"
     )
     assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == (
-        "89cbc4a212ddd6eee83f6d3bb6a1a9babd59508fcbb591c0a3fe27104435778a"
+        "a5e9d8c7b26c83640103e2c0bb8786c89ffcef8777f98ae3ec06e1fd3e255a66"
     )
+
+
+def test_list_models_adds_astra_context_without_client_version():
+    payload = list_models_payload(
+        api_index=0,
+        api_list=["sk-test"],
+        model_response_cache={},
+        config={"api_keys": [{"api": "sk-test"}]},
+        models_list={"sk-test": ["gpt-6-astra"]},
+        build_models=lambda *_: [
+            {"id": "gpt-6-astra", "object": "model", "created": 1, "owned_by": "uni-api"}
+        ],
+    )
+    astra = next(item for item in payload["data"] if item["id"] == "gpt-6-astra")
+    assert astra["context_window"] == 600000
+    assert astra["max_context_window"] == 872000
 
 
 async def test_admin_config_handlers_read_and_update_runtime_state():

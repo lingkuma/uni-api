@@ -212,12 +212,19 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
         StatusCode::OK,
         json!({
             "object": "list",
-            "data": models.into_iter().map(|model| json!({
-                "id": model,
-                "object": "model",
-                "created": MODEL_CREATED,
-                "owned_by": "uni-api",
-            })).collect::<Vec<_>>(),
+            "data": models.into_iter().map(|model| {
+                let mut item = json!({
+                    "id": model.clone(),
+                    "object": "model",
+                    "created": MODEL_CREATED,
+                    "owned_by": "uni-api",
+                });
+                if model == "gpt-6-astra" {
+                    item["context_window"] = json!(600000);
+                    item["max_context_window"] = json!(872000);
+                }
+                item
+            }).collect::<Vec<_>>(),
         }),
     )
 }

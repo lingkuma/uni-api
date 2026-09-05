@@ -11,6 +11,8 @@ from core.utils import get_model_dict
 MODEL_INFO_CREATED = 1720524448858
 CODEX_PRO_MODELS_SNAPSHOT_CLIENT_VERSION = "0.153.2"
 CODEX_PRO_MODELS_SNAPSHOT_UPSTREAM_ETAG = 'W/"568f1e5faa711c9a79e1426428e2ea34"'
+GPT6_ASTRA_CONTEXT_WINDOW = 600000
+GPT6_ASTRA_MAX_CONTEXT_WINDOW = 872000
 
 _CODEX_PRO_MODELS_SNAPSHOT = json.loads(
     Path(__file__).with_name("codex_models_pro_0_153_2.json").read_text(encoding="utf-8")
@@ -183,6 +185,14 @@ def list_models_payload(
     models = model_response_cache.get(api_key)
     if models is None:
         models = build_models(api_index, config, api_list, models_list)
+    # Keep the regular OpenAI-compatible response useful for Codex callers too.
+    # Codex normally requests the richer snapshot with client_version, but the
+    # model metadata must remain consistent when that query parameter is absent.
+    models = copy.deepcopy(models)
+    for model in models:
+        if model.get("id") == "gpt-6-astra":
+            model["context_window"] = GPT6_ASTRA_CONTEXT_WINDOW
+            model["max_context_window"] = GPT6_ASTRA_MAX_CONTEXT_WINDOW
     return {"object": "list", "data": models}
 
 
