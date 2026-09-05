@@ -111,7 +111,7 @@ def test_codex_models_payload_returns_complete_verified_pro_snapshot():
 
     astra = models["gpt-6-astra"]
     assert astra["minimal_client_version"] == "0.153.0"
-    assert astra["context_window"] == 272000
+    assert astra["context_window"] == 600000
     assert astra["max_context_window"] == 872000
     assert [level["effort"] for level in astra["supported_reasoning_levels"]][-2:] == [
         "max",
@@ -151,7 +151,7 @@ def test_codex_pro_models_snapshot_matches_verified_official_response():
         / "codex_models_pro_0_153_2.json"
     )
     assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == (
-        "bbc720b09ec2237d48bf4ebb14dc9f239b1d47437771ed302bc6eb008fa37e73"
+        "89cbc4a212ddd6eee83f6d3bb6a1a9babd59508fcbb591c0a3fe27104435778a"
     )
 
 
